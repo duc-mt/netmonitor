@@ -98,7 +98,7 @@ list_add() {
   if [ "$dry" -eq 0 ]; then
     current=$(lnms_run config:get "$key" 2>/dev/null || true)
   fi
-  if printf '%s\n' "$current" | tr '\133\135,"\047\t ' '\n\n\n\n\n\n\n' | grep -Fx -- "$value" >/dev/null; then
+  if printf '%s\n' "$current" | tr -s '[]",'\''\t ' '\n' | grep -Fx -- "$value" >/dev/null; then
     echo "  $key: $value is already there"
     return 0
   fi

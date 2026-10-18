@@ -64,6 +64,8 @@ def mounts(service):
 
 
 def run_script(script, env_path, extra_env=None):
+    # Compose yaml uses $$ to escape literal $; unescape for standalone execution
+    script = script.replace("$$", "$")
     env = {"PATH": env_path}
     env.update(extra_env or {})
     return subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True)

@@ -44,8 +44,9 @@ if [ "$TARGET" = "latest" ]; then
 fi
 case "$TARGET" in librenms-*) ;; *) TARGET="librenms-$TARGET" ;; esac
 
-[ -f "backups/$TARGET-db.sql.gz" ] && [ -f "backups/$TARGET-data.tgz" ] \
-  || die "backups/$TARGET-db.sql.gz and backups/$TARGET-data.tgz must both exist"
+if [ ! -f "backups/$TARGET-db.sql.gz" ] || [ ! -f "backups/$TARGET-data.tgz" ]; then
+  die "backups/$TARGET-db.sql.gz and backups/$TARGET-data.tgz must both exist"
+fi
 
 echo "About to restore '$TARGET'. The current LibreNMS database and data will be REPLACED."
 if [ "$YES" -ne 1 ]; then

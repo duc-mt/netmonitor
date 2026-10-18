@@ -116,7 +116,7 @@ jobs:
           $text = [System.IO.File]::ReadAllText('.env')
           if ($text -notmatch '(?m)^MYSQL_PASSWORD=[A-Za-z0-9]{32}$') { throw 'bad MYSQL_PASSWORD' }
           if ($text -notmatch '(?m)^LIBRENMS_SNMP_COMMUNITY=[A-Za-z0-9]{24}$') { throw 'bad LIBRENMS_SNMP_COMMUNITY' }
-          Remove-Item .env
+          Remove-Item -Force .env
 
       - name: setup.ps1 (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
@@ -173,7 +173,7 @@ jobs:
           $out = (./scripts/run.ps1 configure -DryRun *>&1 | Out-String)
           if ($out -notmatch [regex]::Escape('lnms config:set nfsen_enable true')) { throw "missing nfsen_enable in: $out" }
           if ($out -notmatch [regex]::Escape('lnms config:set email_smtp_host msmtpd')) { throw "missing email_smtp_host in: $out" }
-          Remove-Item .env
+          Remove-Item -Force .env
 
       - name: scripts/run.ps1 configure -DryRun (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
@@ -184,7 +184,7 @@ jobs:
           $out = (.\scripts\run.ps1 configure -DryRun *>&1 | Out-String)
           if ($out -notmatch [regex]::Escape('lnms config:set nfsen_enable true')) { throw "missing nfsen_enable in: $out" }
           if ($out -notmatch [regex]::Escape('lnms config:set email_smtp_host msmtpd')) { throw "missing email_smtp_host in: $out" }
-          Remove-Item .env
+          Remove-Item -Force .env
 
   e2e:
     # The real thing: start LibreNMS, then back up, break, restore. Linux only:
