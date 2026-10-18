@@ -1,0 +1,9 @@
+# Keep line endings stable on every OS. The shell scripts also run inside Linux
+# containers, where a stray CR (Windows checkout) would break them.
+* text=auto
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+.env* text eol=lf
+*.ps1 text eol=crlf
+tests/fakebin/docker text eol=lf

@@ -1,0 +1,378 @@
+# LibreNMS on Docker Compose.
+# Runs the same on Linux, macOS (Intel and Apple Silicon) and Windows (Docker Desktop):
+# only named volumes and relative paths are used, nothing platform specific.
+#
+#   first time:  scripts/setup.sh   (Linux/macOS)   or   scripts\setup.ps1   (Windows)
+#   afterwards:  docker compose up -d
+#
+# Based on the official example in https://github.com/librenms/docker (examples/compose).
+name: netmonitor
+
+# Environment shared by every LibreNMS container (web, dispatcher, syslog, traps).
+x-librenms-env: &librenms-env
+  TZ: ${TZ:-UTC}
+  PUID: ${PUID:-1000}
+  PGID: ${PGID:-1000}
+  DB_HOST: db
+  DB_NAME: ${MYSQL_DATABASE:-librenms}
+  DB_USER: ${MYSQL_USER:-librenms}
+  DB_PASSWORD: "${MYSQL_PASSWORD:?MYSQL_PASSWORD is empty. Run the setup script first, it creates .env with random secrets}"
+  DB_TIMEOUT: "120"
+  REDIS_HOST: redis
+  CACHE_DRIVER: redis
+  SESSION_DRIVER: redis
+  MEMORY_LIMIT: ${MEMORY_LIMIT:-256M}
+  MAX_INPUT_VARS: ${MAX_INPUT_VARS:-1000}
+  UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-16M}
+  OPCACHE_MEM_SIZE: ${OPCACHE_MEM_SIZE:-128}
+  LIBRENMS_BASE_URL: ${LIBRENMS_BASE_URL:-/}
+  # SNMPv2c community of the LibreNMS container itself (its own "localhost" device).
+  LIBRENMS_SNMP_COMMUNITY: "${LIBRENMS_SNMP_COMMUNITY:?LIBRENMS_SNMP_COMMUNITY is empty. Run the setup script first}"
+
+# Container logs: without a limit the default json-file driver grows forever. 3 files of 20 MB per container.
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+x-librenms-service: &librenms-service
+  image: librenms/librenms:${LIBRENMS_VERSION:-latest}
+  cap_add:
+    - NET_ADMIN   # needed for ICMP ping and raw sockets
+    - NET_RAW
+  volumes:
+    - data:/data
+  logging: *default-logging
+  restart: unless-stopped
+
+services:
+  db:
+    image: mariadb:${MARIADB_VERSION:-10.11}
+    command:
+      - mysqld
+      - --innodb-file-per-table=1
+      - --lower-case-table-names=0
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # Tuning for LibreNMS' constant stream of small metric writes (see README, "Tuning").
+      - --innodb-buffer-pool-size=${MARIADB_BUFFER_POOL_SIZE:-512M}
+      # 2 = write the log to disk once a second instead of at every commit: far fewer disk writes.
+      # A power failure or OS crash can lose the last second of changes; a MariaDB crash alone loses nothing.
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-log-file-size=128M
+      - --max-connections=${MARIADB_MAX_CONNECTIONS:-250}
+    environment:
+      TZ: ${TZ:-UTC}
+      MARIADB_RANDOM_ROOT_PASSWORD: "yes"
+      MARIADB_DATABASE: ${MYSQL_DATABASE:-librenms}
+      MARIADB_USER: ${MYSQL_USER:-librenms}
+      MARIADB_PASSWORD: "${MYSQL_PASSWORD:?MYSQL_PASSWORD is empty. Run the setup script first}"
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    # A bigger buffer pool takes longer to flush: give MariaDB time to stop cleanly (default is 10 s).
+    stop_grace_period: 60s
+    logging: *default-logging
+    restart: unless-stopped
+
+  redis:
+    image: redis:${REDIS_VERSION:-7.2-alpine}
+    environment:
+      TZ: ${TZ:-UTC}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Web UI. The image has no healthcheck of its own, so one is defined here;
+  # "docker compose up --wait" relies on it. The first start runs the database
+  # migrations and can take a few minutes, hence the long start_period.
+  librenms:
+    <<: *librenms-service
+    hostname: librenms
+    ports:
+      # 127.0.0.1 by default: set LIBRENMS_BIND=0.0.0.0 in .env to serve your LAN.
+      - "${LIBRENMS_BIND:-127.0.0.1}:${LIBRENMS_PORT:-8000}:8000"
+    volumes:
+      - data:/data
+      # RRD files written by the optional "netflow" profile, read only: LibreNMS just draws them in the device
+      # "Netflow" tab. The volume is empty, and the mount harmless, while that profile is not used.
+      - nfsen:/netflow:ro
+    environment:
+      <<: *librenms-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8000/"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 180s
+
+  # Runs the pollers. Without at least one dispatcher nothing is ever polled.
+  dispatcher:
+    <<: *librenms-service
+    hostname: librenms-dispatcher
+    environment:
+      <<: *librenms-env
+      DISPATCHER_NODE_ID: dispatcher1
+      SIDECAR_DISPATCHER: "1"
+      # Poller worker count (see README, "Tuning"). If your image version ignores this variable,
+      # set the same number in LibreNMS itself, as the README describes.
+      DISPATCHER_WORKERS: ${DISPATCHER_WORKERS:-8}
+    depends_on:
+      librenms:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---- optional, enable with COMPOSE_PROFILES=syslog,traps,ntopng,mail,netflow in .env -----
+  syslogng:
+    <<: *librenms-service
+    profiles: ["syslog"]
+    hostname: librenms-syslogng
+    # The receivers only listen on a port. They need none of the extra capabilities of the web and dispatcher
+    # containers (those are for ICMP polling) and no raw sockets either, so both are taken away.
+    cap_add: []
+    cap_drop:
+      - NET_RAW
+    ports:
+      - "${SYSLOG_PORT:-514}:514/udp"
+      - "${SYSLOG_PORT:-514}:514/tcp"
+    environment:
+      <<: *librenms-env
+      SIDECAR_SYSLOGNG: "1"
+    depends_on:
+      librenms:
+        condition: service_healthy
+
+  snmptrapd:
+    <<: *librenms-service
+    profiles: ["traps"]
+    hostname: librenms-snmptrapd
+    # The receivers only listen on a port. They need none of the extra capabilities of the web and dispatcher
+    # containers (those are for ICMP polling) and no raw sockets either, so both are taken away.
+    cap_add: []
+    cap_drop:
+      - NET_RAW
+    ports:
+      - "${TRAP_PORT:-162}:162/udp"
+      - "${TRAP_PORT:-162}:162/tcp"
+    environment:
+      <<: *librenms-env
+      SIDECAR_SNMPTRAPD: "1"
+    depends_on:
+      librenms:
+        condition: service_healthy
+
+  # ---- outbound mail relay (profile "mail") ----
+  # LibreNMS sends alert mail to msmtpd:2500 on the internal network and msmtpd relays it to your real
+  # SMTP server, so the SMTP login lives only in .env. Nothing is published on the host. LibreNMS keeps
+  # its mail settings in its own database, so point it at this relay once (README, "Email alerts").
+  msmtpd:
+    image: crazymax/msmtpd:${MSMTPD_VERSION:-latest}
+    profiles: ["mail"]
+    environment:
+      TZ: ${TZ:-UTC}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_TLS: ${SMTP_TLS:-on}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-on}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---- NetFlow / sFlow collector with NfSen (profile "netflow") ----
+  # Collects flows from your routers and switches (one UDP port per device, NfSen calls each one a "source")
+  # and writes the RRD files that LibreNMS draws in its device "Netflow" tab. LibreNMS mounts the same volume
+  # read only at /netflow. See README, "NetFlow / sFlow (NfSen)", for the LibreNMS settings and device naming.
+  # No official NfSen image exists: this is a community build (nfdump 1.7.x, NfSen 1.3.11). Set NFSEN_IMAGE
+  # and NFSEN_VERSION in .env to pin a tag or to use an image you built yourself (README shows how).
+  # NfSen's web UI has no login of its own, so it is published on localhost only by default.
+  nfsen:
+    image: ${NFSEN_IMAGE:-rguaitanele/docker-nfsen}:${NFSEN_VERSION:-latest}
+    profiles: ["netflow"]
+    hostname: nfsen
+    # The image hard-codes PHP's time zone to America/Sao_Paulo, which would shift the times shown in the
+    # NfSen web UI. This sets it from TZ at every start, then runs the image's own entrypoint unchanged.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "date.timezone=$${TZ:-UTC}" > /usr/local/etc/php/conf.d/zz-timezone.ini
+        exec /usr/local/bin/docker-entrypoint
+    environment:
+      TZ: ${TZ:-UTC}
+      NFSEN_SOURCES: "${NFSEN_SOURCES:-router1,2055,#0000ff,netflow}"
+    ports:
+      - "${NFSEN_BIND:-127.0.0.1}:${NFSEN_WEB_PORT:-8080}:80"
+      # Flow exporters send here: one UDP port per source, all inside this range.
+      - "${NFSEN_FLOW_PORT_FIRST:-2055}-${NFSEN_FLOW_PORT_LAST:-2064}:${NFSEN_FLOW_PORT_FIRST:-2055}-${NFSEN_FLOW_PORT_LAST:-2064}/udp"
+    volumes:
+      # nocopy: start empty, like the host folder the image's author tested with. Without it Docker copies
+      # the data directory built into the image into the new volume and the image skips its first-run setup.
+      - type: volume
+        source: nfsen
+        target: /data
+        volume:
+          nocopy: true
+    stop_grace_period: 30s   # lets NfSen stop its daemons and finish writing the RRD files
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Makes the NfSen statistics (RRD files) readable for the LibreNMS container, whatever user NfSen creates
+  # them as. It only touches profiles-stat, never the flow data. Same image as nfsen (nothing extra to
+  # download), no network. The image's own healthcheck watches the NfSen daemon, so it is switched off here.
+  # Locked down to what chmod needs: FOWNER to change files that belong to another user, DAC_OVERRIDE to
+  # enter folders that are private to that user. A failed chmod is logged (docker compose logs nfsen-perms).
+  nfsen-perms:
+    image: ${NFSEN_IMAGE:-rguaitanele/docker-nfsen}:${NFSEN_VERSION:-latest}
+    profiles: ["netflow"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while :; do
+          if [ -d /data/nfsen/profiles-stat ]; then
+            chmod -R a+rX /data/nfsen/profiles-stat || echo "nfsen-perms: chmod failed"
+          fi
+          sleep 60
+        done
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - FOWNER
+      - DAC_OVERRIDE
+    network_mode: none
+    healthcheck:
+      disable: true
+    volumes:
+      - type: volume
+        source: nfsen
+        target: /data
+        volume:
+          nocopy: true   # as for nfsen: whichever of the two starts first must not pre-fill the volume
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---- traffic analytics: ntopng Community Edition (profile "ntopng", Linux hosts only) ----
+  # Capture method: live packet capture on ONE host network interface, ideally a
+  # mirror/SPAN port. Set NTOPNG_INTERFACE in .env (list names with: ip -br link).
+  # Why network_mode: host: it is the only way a container can see the host's real
+  # interfaces. On Docker Desktop (Windows, macOS) "host" is the Docker VM, so this
+  # profile is Linux only. Because of host mode, "ports:" does not apply: the web UI
+  # address is set with ntopng's -w option (NTOPNG_BIND and NTOPNG_WEB_PORT).
+  # Capabilities: NET_RAW (capture) and NET_ADMIN (promiscuous mode). Not privileged.
+  # Community edition only: no license key is configured or needed.
+  ntopng:
+    image: ntop/ntopng:${NTOPNG_VERSION:-stable}
+    profiles: ["ntopng"]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command:
+      - "-i"
+      - "${NTOPNG_INTERFACE:-eth0}"
+      - "-w"
+      - "${NTOPNG_BIND:-127.0.0.1}:${NTOPNG_WEB_PORT:-3000}"
+      - "-r"
+      - "127.0.0.1:${NTOPNG_REDIS_PORT:-6380}"
+      - "-d"
+      - "/var/lib/ntopng"
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ntopng:/var/lib/ntopng
+    depends_on:
+      ntopng-redis:
+        condition: service_healthy
+    healthcheck:
+      # Plain /bin/sh, so it does not depend on bash or on this image's tools: ask the web server with curl,
+      # else wget; if the image has neither, check that the ntopng process exists. $$ is a literal $ for the shell.
+      test:
+        - CMD-SHELL
+        - |
+          url="http://${NTOPNG_BIND:-127.0.0.1}:${NTOPNG_WEB_PORT:-3000}/"
+          if command -v curl >/dev/null 2>&1; then curl -fsS -o /dev/null --max-time 3 "$$url"; exit $$?; fi
+          if command -v wget >/dev/null 2>&1; then wget -q -O /dev/null -T 3 "$$url"; exit $$?; fi
+          for f in /proc/[0-9]*/comm; do read -r c < "$$f" 2>/dev/null && [ "$$c" = ntopng ] && exit 0; done
+          exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ntopng keeps its users, password and settings in Redis. A dedicated Redis with its
+  # own volume makes them survive "docker compose up" recreating the container (without
+  # it the admin login would fall back to the default). It shares ntopng's host network
+  # and listens on 127.0.0.1 only; it is separate from the LibreNMS Redis on purpose.
+  ntopng-redis:
+    image: redis:${REDIS_VERSION:-7.2-alpine}
+    profiles: ["ntopng"]
+    network_mode: host
+    command:
+      - "redis-server"
+      - "--bind"
+      - "127.0.0.1"
+      - "--port"
+      - "${NTOPNG_REDIS_PORT:-6380}"
+      - "--appendonly"
+      - "yes"
+      - "--dir"
+      - "/data"
+    volumes:
+      - ntopng-redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p ${NTOPNG_REDIS_PORT:-6380} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---- on-demand helper used by scripts/backup.* and scripts/restore.* -------
+  # Same MariaDB image, so the client tools match the server. It mounts the data
+  # volume and ./backups; the logic lives in scripts/container/*.sh so no shell
+  # quoting has to survive a trip through PowerShell.
+  tools:
+    image: mariadb:${MARIADB_VERSION:-10.11}
+    profiles: ["tools"]
+    entrypoint: ["bash"]
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      DB_HOST: db
+      DB_NAME: ${MYSQL_DATABASE:-librenms}
+      DB_USER: ${MYSQL_USER:-librenms}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-}
+    volumes:
+      - data:/data
+      - ./backups:/backups
+      - ./scripts/container:/scripts:ro
+    restart: "no"
+
+volumes:
+  data:
+  db:
+  nfsen:          # read only in librenms, filled by the netflow profile
+  ntopng:         # these two are only created when the ntopng profile is used
+  ntopng-redis:

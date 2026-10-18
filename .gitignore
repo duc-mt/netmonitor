@@ -1,0 +1,18 @@
+# secrets and data never go to Git
+.env
+# setup.sh/setup.ps1 write secrets to a temp file (.env.tmp.<pid>) first; keep leftovers out too
+.env.*
+!.env.example
+backups/
+*.bak
+*.pem
+*.key
+*.crt
+.DS_Store
+# site-specific overrides (may hold SNMPv3 trap passphrases)
+compose.override.yaml
+snmptrapd.local.conf
+
+# AI agent metadata
+.agents/
+skills-lock.json

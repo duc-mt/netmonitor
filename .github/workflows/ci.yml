@@ -1,0 +1,393 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"   # weekly: catches breakage from new upstream images
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint and compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -s sh run && shellcheck -s bash scripts/*.sh scripts/container/*.sh tests/*.sh tests/fakebin/docker
+
+      - name: compose file is valid (default services and every profile)
+        run: |
+          cp .env.example .env
+          sed -i 's/^MYSQL_PASSWORD=$/MYSQL_PASSWORD=ci/; s/^LIBRENMS_SNMP_COMMUNITY=$/LIBRENMS_SNMP_COMMUNITY=ci/' .env
+          docker compose config --quiet
+          COMPOSE_PROFILES=syslog,traps,ntopng,mail,netflow,tools docker compose config --quiet
+
+      - name: optional services are opt-in; ntopng is unprivileged and the only host-network service
+        run: |
+          cp .env.example .env
+          sed -i 's/^MYSQL_PASSWORD=$/MYSQL_PASSWORD=ci/; s/^LIBRENMS_SNMP_COMMUNITY=$/LIBRENMS_SNMP_COMMUNITY=ci/' .env
+          default_services=$(docker compose config --services)
+          if grep -Eq '^(ntopng|msmtpd|nfsen)' <<<"$default_services"; then
+            echo "::error::ntopng, msmtpd and nfsen must be opt-in profiles, not part of the default stack"; exit 1
+          fi
+          full=$(COMPOSE_PROFILES=ntopng,netflow docker compose config)
+          if grep -Eq 'privileged: *true' <<<"$full"; then
+            echo "::error::a service is privileged"; exit 1
+          fi
+          # host networking only for ntopng and its Redis
+          test "$(grep -c 'network_mode: host' <<<"$full")" = 2
+
+      - name: compose refuses to start without generated secrets
+        run: |
+          cp .env.example .env
+          if docker compose config --quiet 2>err.txt; then
+            echo "::error::compose accepted an empty database password"; exit 1
+          fi
+          grep -q "Run the setup script" err.txt
+
+      - name: tracked files are plain ASCII and text files use LF line endings
+        run: |
+          if git ls-files -z | xargs -0 grep -lP '[^\x00-\x7F]'; then
+            echo "::error::non-ASCII characters break Windows PowerShell 5.1"; exit 1
+          fi
+          if grep -rl $'\r' --include='*.sh' --include='*.yaml' --include='*.yml' --include='*.md' --include='.env*' .; then
+            echo "::error::CR line endings found in files that run in Linux containers"; exit 1
+          fi
+
+  tests:
+    # tests/ needs no Docker: a fake docker records the calls. The macOS run checks that ./run works with
+    # the bash 3.2 that macOS ships; it is new, so it does not fail the workflow yet.
+    name: script tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: run tests/all.sh
+        run: bash tests/all.sh
+
+  setup-scripts:
+    # Runs the real setup scripts on all three operating systems. Docker itself is
+    # not needed here: -NoStart / --no-start only create .env.
+    name: setup scripts on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup.sh (Linux and macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash scripts/setup.sh --no-start
+          first=$(grep '^MYSQL_PASSWORD=' .env)
+          bash scripts/setup.sh --no-start          # second run must keep the secrets
+          test "$first" = "$(grep '^MYSQL_PASSWORD=' .env)"
+          grep -Eq '^MYSQL_PASSWORD=[A-Za-z0-9]{32}$' .env
+          grep -Eq '^LIBRENMS_SNMP_COMMUNITY=[A-Za-z0-9]{24}$' .env
+          grep -Eq '^TZ=[A-Za-z]' .env
+          ls -l .env | cut -c1-10 | grep -q '^-rw-------$'   # private to the owner
+          rm .env
+
+      - name: setup.ps1 (PowerShell 7)
+        shell: pwsh
+        run: |
+          ./scripts/setup.ps1 -NoStart
+          $first = Select-String -Path .env -Pattern '^MYSQL_PASSWORD=' | Select-Object -First 1
+          ./scripts/setup.ps1 -NoStart
+          $again = Select-String -Path .env -Pattern '^MYSQL_PASSWORD=' | Select-Object -First 1
+          if ($first.Line -ne $again.Line) { throw 'secrets changed on the second run' }
+          $bytes = [System.IO.File]::ReadAllBytes('.env')
+          if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB) { throw '.env starts with a UTF-8 BOM' }
+          if ($bytes -contains 13) { throw '.env contains CR characters' }
+          $text = [System.IO.File]::ReadAllText('.env')
+          if ($text -notmatch '(?m)^MYSQL_PASSWORD=[A-Za-z0-9]{32}$') { throw 'bad MYSQL_PASSWORD' }
+          if ($text -notmatch '(?m)^LIBRENMS_SNMP_COMMUNITY=[A-Za-z0-9]{24}$') { throw 'bad LIBRENMS_SNMP_COMMUNITY' }
+          Remove-Item .env
+
+      - name: setup.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./scripts/setup.ps1 -NoStart
+          $bytes = [System.IO.File]::ReadAllBytes('.env')
+          if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB) { throw '.env starts with a UTF-8 BOM' }
+          if ($bytes -contains 13) { throw '.env contains CR characters' }
+          $text = [System.IO.File]::ReadAllText('.env')
+          if ($text -notmatch '(?m)^MYSQL_PASSWORD=[A-Za-z0-9]{32}$') { throw 'bad MYSQL_PASSWORD' }
+          Write-Host "TZ line: $((Select-String -Path .env -Pattern '^TZ=').Line)"
+
+      - name: ./run launcher (Linux and macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ./run help | grep -q 'validate'
+          code=0; ./run bogus >/dev/null 2>&1 || code=$?
+          test "$code" = 2
+
+      - name: scripts/run.ps1 launcher (PowerShell 7)
+        shell: pwsh
+        run: |
+          ./scripts/run.ps1 help
+          ./scripts/run.ps1 bogus
+          if ($LASTEXITCODE -ne 2) { throw "expected exit code 2, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
+      - name: scripts/run.ps1 launcher (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          .\scripts\run.ps1 help
+          .\scripts\run.ps1 bogus
+          if ($LASTEXITCODE -ne 2) { throw "expected exit code 2, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
+      - name: ./run configure --dry-run (Linux and macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash scripts/setup.sh --no-start
+          out=$(COMPOSE_PROFILES=mail,netflow ./run configure --dry-run)
+          grep -Fxq 'lnms config:set nfsen_enable true' <<<"$out"
+          grep -Fxq 'lnms config:set email_smtp_host msmtpd' <<<"$out"
+          rm .env
+
+      - name: scripts/run.ps1 configure -DryRun (PowerShell 7)
+        shell: pwsh
+        run: |
+          ./scripts/setup.ps1 -NoStart
+          $env:COMPOSE_PROFILES = 'mail,netflow'
+          $out = (./scripts/run.ps1 configure -DryRun *>&1 | Out-String)
+          if ($out -notmatch [regex]::Escape('lnms config:set nfsen_enable true')) { throw "missing nfsen_enable in: $out" }
+          if ($out -notmatch [regex]::Escape('lnms config:set email_smtp_host msmtpd')) { throw "missing email_smtp_host in: $out" }
+          Remove-Item .env
+
+      - name: scripts/run.ps1 configure -DryRun (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./scripts/setup.ps1 -NoStart
+          $env:COMPOSE_PROFILES = 'mail,netflow'
+          $out = (.\scripts\run.ps1 configure -DryRun *>&1 | Out-String)
+          if ($out -notmatch [regex]::Escape('lnms config:set nfsen_enable true')) { throw "missing nfsen_enable in: $out" }
+          if ($out -notmatch [regex]::Escape('lnms config:set email_smtp_host msmtpd')) { throw "missing email_smtp_host in: $out" }
+          Remove-Item .env
+
+  e2e:
+    # The real thing: start LibreNMS, then back up, break, restore. Linux only:
+    # GitHub's macOS and Windows runners cannot run Linux containers.
+    name: end to end (Linux)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: start LibreNMS with the setup script
+        run: bash scripts/setup.sh
+
+      - name: web UI answers and the database was migrated
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/)
+          echo "HTTP $code"
+          test "$code" = 200 || test "$code" = 302
+          docker compose ps --status running --services | grep -qx dispatcher
+          tables=$(docker compose exec -T db sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -N -u"$MARIADB_USER" "$MARIADB_DATABASE" -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()"')
+          echo "tables: $tables"
+          test "$tables" -gt 50
+
+      - name: MariaDB tuning is applied
+        run: |
+          vars=$(docker compose exec -T db sh -c 'MYSQL_PWD="$MARIADB_PASSWORD" mariadb -N -u"$MARIADB_USER" "$MARIADB_DATABASE" -e "SELECT @@innodb_buffer_pool_size, @@innodb_flush_log_at_trx_commit, @@max_connections"')
+          echo "buffer pool, flush policy, max connections: $vars"
+          test "$(echo "$vars" | awk '{print $2, $3}')" = "2 250"
+          test "$(echo "$vars" | awk '{print $1}')" -ge 536870912
+
+      - name: LibreNMS sees the NetFlow volume, read only
+        run: |
+          docker compose exec -T librenms test -d /netflow
+          if docker compose exec -T librenms touch /netflow/.write-test 2>/dev/null; then
+            echo "::error::/netflow must be mounted read only in the LibreNMS container"; exit 1
+          fi
+
+      - name: doctor finds nothing wrong with a fresh install
+        run: ./run doctor
+
+      - name: configure applies the settings and is safe to repeat
+        run: |
+          ./run configure
+          ./run configure
+          workers=$(docker compose exec -T --user librenms librenms lnms config:get service_poller_workers)
+          echo "service_poller_workers: $workers"
+          test "$(echo "$workers" | tr -d '[:space:]')" = 8
+
+      - name: backup, damage the database, restore
+        run: |
+          marker='MYSQL_PWD="$MARIADB_PASSWORD" mariadb -u"$MARIADB_USER" "$MARIADB_DATABASE" -e'
+          docker compose exec -T db sh -c "$marker 'CREATE TABLE ci_marker (id INT)'"
+          bash scripts/backup.sh --keep 3
+          ls -l backups
+          test "$(ls backups | grep -c -- '-db.sql.gz$')" = 1
+          docker compose exec -T db sh -c "$marker 'DROP TABLE ci_marker'"
+          bash scripts/restore.sh latest --yes
+          docker compose exec -T db sh -c "$marker 'SELECT COUNT(*) FROM ci_marker'"
+          docker compose ps --status running --services | grep -qx dispatcher
+
+      - name: backup skips logs and cache, restore accepts a file path
+        run: |
+          db=$(ls backups/*-db.sql.gz | head -n 1)
+          data=${db%-db.sql.gz}-data.tgz
+          members=$(tar tzf "$data")
+          if grep -Eq '^\./(logs|cache)/.' <<<"$members"; then
+            echo "::error::logs or cache ended up in the backup"; exit 1
+          fi
+          ./run restore "./$db" --yes
+          ./run status | grep -q librenms
+          docker compose ps --status running --services | grep -qx dispatcher
+
+      - name: update backs up, pulls and restarts
+        run: |
+          ./run update
+          found=0
+          for f in backups/update-*.txt; do if [ -e "$f" ]; then found=1; fi; done
+          test "$found" = 1
+          docker compose ps --status running --services | grep -qx dispatcher
+
+      - name: logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail 80
+
+      - name: clean up
+        if: always()
+        run: docker compose down -v
+
+  profiles:
+    # Starts each optional profile for real and checks that it comes up. New, and not yet seen green, so a
+    # failure here does not fail the workflow: remove "continue-on-error" after the first green run.
+    name: profile ${{ matrix.profiles }}
+    runs-on: ubuntu-latest
+    needs: [lint]
+    continue-on-error: true
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        profiles: ["syslog,traps", "mail", "netflow", "ntopng"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: create .env for this profile
+        run: |
+          bash scripts/setup.sh --no-start
+          sed -i "s/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=${{ matrix.profiles }}/" .env
+          sed -i 's/^SMTP_HOST=.*/SMTP_HOST=localhost/' .env
+          iface=$(ip route show default | awk '{print $5; exit}')
+          sed -i "s/^NTOPNG_INTERFACE=.*/NTOPNG_INTERFACE=$iface/" .env
+
+      - name: start the stack with the profile
+        run: docker compose up -d --wait
+
+      - name: the profile's containers are running
+        run: |
+          running=$(docker compose ps --status running --services)
+          echo "$running"
+          case "${{ matrix.profiles }}" in
+            syslog,traps) want="syslogng snmptrapd" ;;
+            mail) want="msmtpd" ;;
+            netflow) want="nfsen nfsen-perms" ;;
+            ntopng) want="ntopng ntopng-redis" ;;
+          esac
+          for svc in $want; do
+            grep -qx "$svc" <<<"$running" || { echo "::error::$svc is not running"; exit 1; }
+          done
+
+      - name: syslog and trap ports are published
+        if: matrix.profiles == 'syslog,traps'
+        run: |
+          ss -lnu | grep -E ':514 '
+          ss -lnu | grep -E ':162 '
+
+      - name: receivers keep running without the extra capabilities
+        if: matrix.profiles == 'syslog,traps'
+        run: |
+          sleep 20
+          running=$(docker compose ps --status running --services)
+          grep -qx syslogng <<<"$running"
+          grep -qx snmptrapd <<<"$running"
+          for svc in syslogng snmptrapd; do
+            docker inspect --format '{{.Name}} cap_add={{.HostConfig.CapAdd}} cap_drop={{.HostConfig.CapDrop}}' "$(docker compose ps -q "$svc")"
+          done
+
+      - name: mail relay stays up and configure points LibreNMS at it
+        if: matrix.profiles == 'mail'
+        run: |
+          sleep 20
+          docker compose ps --status running --services | grep -qx msmtpd
+          ./run configure
+          docker compose exec -T --user librenms librenms lnms config:get email_smtp_host | grep -q msmtpd
+
+      - name: NetFlow chain, the RRD file exists and LibreNMS can read it
+        if: matrix.profiles == 'netflow'
+        run: |
+          rrd=/netflow/nfsen/profiles-stat/live/router1.rrd
+          for i in $(seq 1 24); do
+            if docker compose exec -T --user librenms librenms test -r "$rrd"; then break; fi
+            sleep 10
+          done
+          docker compose exec -T --user librenms librenms ls -l /netflow/nfsen/profiles-stat/live/
+          docker compose exec -T --user librenms librenms rrdtool info "$rrd" | sed -n '1,20p'
+
+      - name: the permission guard works with its reduced capabilities
+        if: matrix.profiles == 'netflow'
+        run: |
+          logs=$(docker compose logs nfsen-perms)
+          if grep -q 'chmod failed' <<<"$logs"; then echo "::error::nfsen-perms could not change permissions"; echo "$logs"; exit 1; fi
+          docker compose exec -T nfsen sh -c 'f=/data/nfsen/profiles-stat/live/perm-test.rrd; echo x > "$f"; chmod 600 "$f"'
+          ok=0
+          for i in $(seq 1 12); do
+            if docker compose exec -T --user librenms librenms test -r /netflow/nfsen/profiles-stat/live/perm-test.rrd; then ok=1; break; fi
+            sleep 10
+          done
+          docker compose exec -T nfsen rm -f /data/nfsen/profiles-stat/live/perm-test.rrd
+          test "$ok" = 1
+
+      - name: NetFlow settings are applied once, however often configure runs
+        if: matrix.profiles == 'netflow'
+        run: |
+          ./run configure
+          ./run configure
+          rrds=$(docker compose exec -T --user librenms librenms lnms config:get nfsen_rrds)
+          echo "$rrds"
+          test "$(echo "$rrds" | tr '\133\135,"' '\n\n\n\n' | grep -Fxc '/netflow/nfsen/profiles-stat')" = 1
+
+      - name: ntopng web UI answers
+        if: matrix.profiles == 'ntopng'
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/)
+          echo "HTTP $code"
+          test "$code" = 200 || test "$code" = 302
+
+      - name: logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail 80
+
+      - name: clean up
+        if: always()
+        run: docker compose down -v
