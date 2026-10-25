@@ -68,8 +68,10 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run restore latest        # Windows: .\scripts\run.ps1 restore latest -Yes
 ./run validate              # LibreNMS' own self-check (validate.php)
 ./run configure             # apply the settings in .env to LibreNMS; safe to repeat (--dry-run: only show)
+./run add-device <host>     # add a device (e.g. ./run add-device 192.168.1.1 -v 2c -c public)
+./run scan <subnet>         # auto-discover subnet devices via SNMP (e.g. ./run scan 192.168.1.0/24)
 ./run update                # back up, pull newer images, restart, self-check (--no-backup skips the backup)
-./run doctor                # check the setup: Docker, .env, profiles, NetFlow sources, memory
+./run doctor [--fix]        # check setup: Docker, .env, memory (--fix repairs .env permissions)
 ```
 
 It works from any directory (`./run up`). On Windows, use `scripts\run.bat up` (CMD) or `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use

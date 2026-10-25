@@ -26,7 +26,9 @@ param(
     [int]$Keep = 0,
     [switch]$Yes,
     [switch]$DryRun,
-    [switch]$NoBackup
+    [switch]$NoBackup,
+    [switch]$Fix,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$ExtraArgs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -172,6 +174,23 @@ function Invoke-Configure {
     }
     else {
         Write-Host "NetFlow: profile 'netflow' is not enabled, skipped."
+    }
+
+    $tgEnabled = Get-Setting 'TELEGRAM_ENABLED' 'false'
+    if ($tgEnabled -eq 'true' -or $tgEnabled -eq '1') {
+        $tgToken = Get-Setting 'TELEGRAM_BOT_TOKEN'
+        $tgChat = Get-Setting 'TELEGRAM_CHAT_ID'
+        if ($tgToken -and $tgChat) {
+            Write-Host 'Telegram alerting:'
+            Set-Lnms @('config:set', 'alerts.telegram.enable', 'true')
+            Set-Lnms @('config:set', 'alerts.telegram.token', $tgToken)
+            Set-Lnms @('config:set', 'alerts.telegram.chat_id', $tgChat)
+            Write-Host "  Telegram alerts configured for chat ID $tgChat"
+        } else {
+            Write-Warning 'TELEGRAM_ENABLED is true but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty.'
+        }
+    } else {
+        Write-Host "Telegram alerting: disabled in .env (TELEGRAM_ENABLED is not true), skipped."
     }
 
     Write-Host 'Done. If the worker count changed, restart the dispatcher: .\run.ps1 restart dispatcher'
@@ -451,6 +470,18 @@ try {
         'doctor'    { Invoke-Doctor }
         'validate' {
             $code = (Invoke-Docker @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'php', 'validate.php')).Code
+        }
+        'add-device' {
+            if (-not $Name) { Fail 'usage: .\scripts\run.ps1 add-device <hostname-or-ip> [options]' }
+            $argsList = @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'php', 'addhost.php', $Name)
+            if ($ExtraArgs) { $argsList += $ExtraArgs }
+            $code = (Invoke-Docker $argsList).Code
+        }
+        'scan' {
+            if (-not $Name) { Fail 'usage: .\scripts\run.ps1 scan <subnet> [options] (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)' }
+            $argsList = @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'python3', 'snmp-scan.py', $Name)
+            if ($ExtraArgs) { $argsList += $ExtraArgs }
+            $code = (Invoke-Docker $argsList).Code
         }
     }
     exit $code

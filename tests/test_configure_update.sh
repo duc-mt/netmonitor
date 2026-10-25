@@ -25,7 +25,7 @@ check "skips NetFlow" grep -q "profile 'netflow' is not enabled" out.txt
 check "needs no docker at all" test ! -s "$FAKE_LOG"
 
 echo "configure --dry-run with the mail and netflow profiles"
-printf "MYSQL_PASSWORD=test\nCOMPOSE_PROFILES=mail,netflow\nDISPATCHER_WORKERS=12\nSMTP_FROM='librenms@example.com'\n" > .env
+printf "MYSQL_PASSWORD=test\nCOMPOSE_PROFILES=mail,netflow\nDISPATCHER_WORKERS=12\nSMTP_FROM='librenms@example.com'\nTELEGRAM_ENABLED=true\nTELEGRAM_BOT_TOKEN='1234:TOKEN'\nTELEGRAM_CHAT_ID='-100123'\n" > .env
 run_code configure --dry-run
 check "worker count comes from .env" has_line 'lnms config:set service_poller_workers 12'
 check "mail backend" has_line 'lnms config:set email_backend smtp'
@@ -38,6 +38,9 @@ check "split character" has_line 'lnms config:set nfsen_split_char _'
 check "RRD folder: live profile" has_line 'lnms config:set nfsen_rrds.+ /netflow/nfsen/profiles-stat/live/'
 check "RRD folder: all profiles" has_line 'lnms config:set nfsen_rrds.+ /netflow/nfsen/profiles-stat'
 check "NfSen base folder" has_line 'lnms config:set nfsen_base.+ /netflow/nfsen/'
+check "Telegram enabled" has_line 'lnms config:set alerts.telegram.enable true'
+check "Telegram token" has_line 'lnms config:set alerts.telegram.token 1234:TOKEN'
+check "Telegram chat" has_line 'lnms config:set alerts.telegram.chat_id -100123'
 
 echo "where the values come from"
 DISPATCHER_WORKERS=3 run_code configure --dry-run

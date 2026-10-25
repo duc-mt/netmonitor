@@ -37,6 +37,8 @@ case $(uname -s) in
     chmod 644 .env
     ./run doctor >out.txt 2>&1 || true
     check "a world-readable .env is a warning" said "can be read by every user"
+    ./run doctor --fix >out.txt 2>&1 || true
+    check "doctor --fix repairs .env permissions" said "permissions fixed to 600"
     chmod 600 .env
     ./run doctor >out.txt 2>&1 || true
     if said "can be read by every user"; then fail "a private .env gives no warning"; else pass "a private .env gives no warning"; fi ;;

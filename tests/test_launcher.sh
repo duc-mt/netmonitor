@@ -31,6 +31,8 @@ expect_call "compose logs -f --tail=100" logs
 expect_call "compose logs -f --tail=100 dispatcher" logs dispatcher
 expect_call "compose ps" status
 expect_call "compose exec -T --user librenms -w /opt/librenms librenms php validate.php" validate
+expect_call "compose exec -T --user librenms -w /opt/librenms librenms php addhost.php 192.168.1.1 -v 2c -c public" add-device 192.168.1.1 -v 2c -c public
+expect_call "compose exec -T --user librenms -w /opt/librenms librenms python3 snmp-scan.py 192.168.1.0/24" scan 192.168.1.0/24
 
 echo "mistakes and missing prerequisites"
 run_code down -v

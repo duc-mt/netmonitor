@@ -9,16 +9,19 @@
 #   ./run backup [--keep N]   back up the database and data to ./backups
 #   ./run restore <target>    restore from ./backups: 'latest', a name or a file path (--yes skips the question)
 #   ./run validate            run LibreNMS' own self-check (validate.php)
-#   ./run configure           apply the settings in .env to LibreNMS (workers, mail, NetFlow); safe to repeat (--dry-run: only show)
+#   ./run configure           apply settings in .env (workers, mail, NetFlow, Telegram, rules); safe to repeat (--dry-run: only show)
+#   ./run add-device <host>   add a device (options: -v [2c|3], -c <community>, -u <user>, -a <pass>, -x <priv>)
+#   ./run scan <subnet>       auto-discover devices on a subnet using snmp-scan.py (e.g. 192.168.1.0/24)
 #   ./run update              back up, pull newer images, restart, self-check (--no-backup skips the backup)
-#   ./run doctor              check the setup (Docker, .env, profiles, memory) before or after the first start
+#   ./run doctor [--fix]      check setup (Docker, .env, profiles, memory); --fix auto-repairs .env permissions
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$ROOT_DIR"
 
-usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die() { echo "error: $*" >&2; exit 1; }
 
 cmd=${1:-help}
@@ -26,17 +29,23 @@ cmd=${1:-help}
 
 case "$cmd" in
   help|-h|--help) usage; exit 0 ;;
-  up|down|restart|logs|status|backup|restore|validate|configure|update|doctor) ;;
+  up|down|restart|logs|status|backup|restore|validate|configure|update|doctor|add-device|scan) ;;
   *) echo "error: unknown command: $cmd" >&2; usage >&2; exit 2 ;;
 esac
 
 dry=0
 no_backup=0
+doctor_fix=0
 need_docker=1
 case "$cmd" in
   doctor)
     # It reports Docker problems itself instead of stopping at the first one.
-    [ $# -eq 0 ] || { echo "error: doctor takes no options" >&2; exit 2; }
+    for arg in "$@"; do
+      case "$arg" in
+        --fix) doctor_fix=1 ;;
+        *) echo "error: doctor: unknown option: $arg" >&2; exit 2 ;;
+      esac
+    done
     need_docker=0 ;;
   configure)
     for arg in "$@"; do
@@ -165,6 +174,24 @@ configure() {
     echo "NetFlow: profile 'netflow' is not enabled, skipped."
   fi
 
+  # Telegram Alerting
+  telegram_on=$(env_get TELEGRAM_ENABLED false)
+  if [ "$telegram_on" = "true" ] || [ "$telegram_on" = "1" ]; then
+    tg_token=$(env_get TELEGRAM_BOT_TOKEN)
+    tg_chat=$(env_get TELEGRAM_CHAT_ID)
+    if [ -n "$tg_token" ] && [ -n "$tg_chat" ]; then
+      echo "Telegram alerting:"
+      lnms_run config:set alerts.telegram.enable true
+      lnms_run config:set alerts.telegram.token "$tg_token"
+      lnms_run config:set alerts.telegram.chat_id "$tg_chat"
+      echo "  Telegram alerts configured for chat ID $tg_chat"
+    else
+      echo "warning: TELEGRAM_ENABLED is true but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty." >&2
+    fi
+  else
+    echo "Telegram alerting: disabled in .env (TELEGRAM_ENABLED is not true), skipped."
+  fi
+
   echo "Done. If the worker count changed, restart the dispatcher: ./run restart dispatcher"
 }
 
@@ -225,7 +252,12 @@ doctor() {
   case $(uname -s) in
     Linux|Darwin)
       if [ -n "$(find .env -perm -004 -print)" ]; then
-        d_warn ".env can be read by every user of this computer and it holds secrets: chmod 600 .env"
+        if [ "$doctor_fix" -eq 1 ]; then
+          chmod 600 .env 2>/dev/null || true
+          d_ok ".env permissions fixed to 600 (--fix)"
+        else
+          d_warn ".env can be read by every user of this computer and it holds secrets: chmod 600 .env (or run ./run doctor --fix)"
+        fi
       else
         d_ok ".env is private to you"
       fi ;;
@@ -418,6 +450,12 @@ case "$cmd" in
   backup) exec bash scripts/backup.sh "$@" ;;
   restore) exec bash scripts/restore.sh "$@" ;;
   validate) docker compose exec -T --user librenms -w /opt/librenms librenms php validate.php ;;
+  add-device)
+    [ $# -ge 1 ] || die "usage: ./run add-device <hostname-or-ip> [options]"
+    docker compose exec -T --user librenms -w /opt/librenms librenms php addhost.php "$@" ;;
+  scan)
+    [ $# -ge 1 ] || die "usage: ./run scan <subnet> [options] (e.g. ./run scan 192.168.1.0/24)"
+    docker compose exec -T --user librenms -w /opt/librenms librenms python3 snmp-scan.py "$@" ;;
   configure) configure ;;
   update) update ;;
   doctor) doctor ;;
