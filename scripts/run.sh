@@ -57,7 +57,23 @@ esac
 [ -f .env ] || die "no .env found. Run scripts/setup.sh first."
 if [ "$need_docker" -eq 1 ]; then
   docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is not available."
-  docker info >/dev/null 2>&1 || die "The Docker daemon is not running."
+  if ! docker info >/dev/null 2>&1; then
+    # If Docker failed due to permissions on Linux and we are not root, attempt auto-elevation via sudo
+    if [ "${EUID:-$(id -u)}" -ne 0 ] && [ -z "${NETMONITOR_SUDO_TRIED:-}" ]; then
+      case "$(uname -s 2>/dev/null)" in
+        Linux)
+          docker_err=$(docker info 2>&1 || true)
+          if echo "$docker_err" | grep -iqE "permission denied|docker\.sock"; then
+            echo "[!] Docker socket requires root privileges (sudo)." >&2
+            echo "    Re-running with sudo..." >&2
+            export NETMONITOR_SUDO_TRIED=1
+            exec sudo "$0" "$cmd" "$@"
+          fi
+          ;;
+      esac
+    fi
+    die "The Docker daemon is not running."
+  fi
 fi
 
 # A setting's value: the environment wins, then .env (surrounding quotes removed), then the default.
