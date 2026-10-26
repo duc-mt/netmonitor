@@ -390,10 +390,11 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
-  # ---- configuration backups: Oxidized (profile "oxidized"), the fallback for netops ----
-  # Takes its device list from the LibreNMS API (README, "Oxidized") and keeps every configuration in a git
-  # repository in the "oxidized" volume. oxidized/render-config.sh builds the config from oxidized/config.tmpl and
-  # the OXIDIZED_* values of .env at every start. Its REST API and web UI have no login: localhost only by default.
+  # ---- configuration backups & visual diffs: Oxidized (profile "oxidized") ----
+  # Native LibreNMS "Config" tab and visual diff engine: takes its device list from the LibreNMS API (README, "Oxidized")
+  # and commits every configuration change to a git repository in the "oxidized" volume. Enables in-browser side-by-side
+  # and inline diff viewing. oxidized/render-config.sh builds the config from oxidized/config.tmpl and the OXIDIZED_*
+  # values of .env at every start. Its REST API and web UI have no login: localhost only by default.
   # Runs as root so the fresh volume is writable whatever user the image defaults to.
   oxidized:
     image: oxidized/oxidized:${OXIDIZED_VERSION:-latest}

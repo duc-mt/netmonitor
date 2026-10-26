@@ -236,7 +236,7 @@ Set `COMPOSE_PROFILES` in `.env`, then `docker compose up -d`:
 | `mail` | msmtpd relay for alert e-mail | none, internal only |
 | `netflow` | NetFlow/sFlow collector with NfSen, feeds the LibreNMS Netflow tab | UDP 2055-2064 (`NFSEN_FLOW_PORT_FIRST` to `_LAST`), web UI `NFSEN_WEB_PORT` (8080, localhost only) |
 | `grafana` | Grafana with the LibreNMS database as a ready datasource and a starter dashboard ([Grafana](#grafana)) | `GRAFANA_PORT` (3001, localhost only) |
-| `oxidized` | Oxidized configuration backups with git history, device list from LibreNMS; fallback for netops ([Oxidized](#oxidized-configuration-backups)) | `OXIDIZED_PORT` (8888, localhost only) |
+| `oxidized` | Continuous config backups, git versioning & native in-browser "Config" diff tab in LibreNMS ([Oxidized](#oxidized-configuration-backups--visual-diffs)) | `OXIDIZED_PORT` (8888, localhost only) |
 | `smokeping` | Smokeping latency and packet-loss graphs ([Smokeping](#smokeping)) | `SMOKEPING_PORT` (8085, localhost only) |
 | `proxy` | Caddy HTTPS front door for all of the above ([HTTPS](#https-reverse-proxy)) | 80 and 443 (`CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`) |
 
@@ -552,11 +552,15 @@ The setup scripts do not generate SMTP values, and `SMTP_PASSWORD` is stored lik
 The datasource uses the same database login as LibreNMS. Grafana only runs SELECT queries from your panels, but anyone
 with the Grafana *Admin* role can run any SQL with that login, so keep that role to people you would trust with LibreNMS.
 
-### Oxidized (configuration backups)
+### Oxidized (configuration backups & visual diffs)
 
-Oxidized is the always-on alternative to [netops](https://github.com/duc-mt/netops) for configuration backups: it
-fetches the device list from LibreNMS, logs in over SSH every hour and commits each change to a git repository.
-Use it when netops is not at hand.
+Oxidized powers the native **Config** tab and visual diff viewer inside LibreNMS, working alongside
+[netops](https://github.com/duc-mt/netops) to give you both full Web UI visibility and CLI automation:
+- **Oxidized (GUI & Continuous Archiving)**: Fetches the device list from LibreNMS, polls configs over SSH on a schedule,
+  commits revisions to a git repository, and embeds an in-browser color-coded line-by-line diff viewer directly on each
+  device page in LibreNMS.
+- **netops (CLI & Change Management)**: Handles on-demand CLI operations, batch configuration pushes, pre-flight safety
+  checks, auto-rollbacks, and password/VLAN rotations.
 
 1. In LibreNMS create an API token (user menu > *API Settings*) and put it, plus the login Oxidized should use on your
    devices, into `.env`: `OXIDIZED_LIBRENMS_TOKEN`, `OXIDIZED_USERNAME`, `OXIDIZED_PASSWORD`.
@@ -565,7 +569,7 @@ Use it when netops is not at hand.
    docker compose exec --user librenms librenms lnms config:set oxidized.enabled true
    docker compose exec --user librenms librenms lnms config:set oxidized.url http://oxidized:8888
    ```
-3. Set `COMPOSE_PROFILES=oxidized`, then `docker compose up -d`. Open <http://localhost:8888> for the node list; the
+3. Set `COMPOSE_PROFILES=oxidized`, then `docker compose up -d`. Open <http://localhost:8888> for the raw node list; the
    configurations are in the `oxidized` volume (`/data/configs.git` in the container).
 4. A device is backed up when its LibreNMS OS maps to an Oxidized model (LibreNMS has a mapping for the common ones; see
    its *Oxidized Integration* documentation to add or exclude devices and groups).
@@ -574,18 +578,21 @@ Use it when netops is not at hand.
 template (not a file in the volume) for changes. The web UI has no login: keep `OXIDIZED_BIND=127.0.0.1`.
 This profile has not been run against real devices by the maintainers of this repository: try it on a lab device first.
 
-### netops inventory
+### netops & netlog inventory
 
-`scripts/netops-sync.sh` writes the LibreNMS network devices as the `inventory.csv` of [netops](https://github.com/duc-mt/netops):
+`scripts/netops-sync.sh` writes the LibreNMS network devices as the shared `inventory.csv` of
+[netops](https://github.com/duc-mt/netops) (change execution & audits) and [netlog](https://github.com/duc-mt/netlog) (log buffer monitoring & auto-triage):
 
 ```bash
-scripts/netops-sync.sh --dry-run        # show the csv only
-scripts/netops-sync.sh                  # write ../netops/inventory.csv (the old file is kept as inventory.csv.bak)
-cd ../netops && ./run backup            # back up every device in it
+scripts/netops-sync.sh --dry-run        # preview the csv without writing
+scripts/netops-sync.sh                  # writes ../netops/inventory.csv and ../netlog/inventory.csv
+cd ../netops && ./run backup            # run on-demand netops backup
+cd ../netlog && ./run                   # run netlog buffer poll & triage
 ```
 
-Use `NETOPS_DIR` or `--output FILE` for another location. The stack must be running. Devices whose LibreNMS OS has no
-netops platform are listed and skipped; credentials stay in netops' own `.env`.
+Use `NETOPS_DIR`, `NETLOG_DIR`, `--netops-output FILE`, `--netlog-output FILE`, or `--only netops|netlog` to customize
+targets. The stack must be running. Existing ports, credential groups, and jump hosts are preserved across syncs. Devices
+whose LibreNMS OS has no supported platform are skipped; credentials stay in each tool's own `.env`.
 
 ### Smokeping
 
