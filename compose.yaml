@@ -261,7 +261,10 @@ services:
       - DAC_OVERRIDE
     network_mode: none
     healthcheck:
-      disable: true
+      test: ["CMD", "true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     volumes:
       - type: volume
         source: nfsen
@@ -281,7 +284,7 @@ services:
   # Capabilities: NET_RAW (capture) and NET_ADMIN (promiscuous mode). Not privileged.
   # Community edition only: no license key is configured or needed.
   ntopng:
-    image: ntop/ntopng:${NTOPNG_VERSION:-stable}
+    image: ntop/ntopng:${NTOPNG_VERSION:-latest}
     profiles: ["ntopng"]
     network_mode: host
     cap_add:

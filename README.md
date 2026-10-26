@@ -330,7 +330,7 @@ settings persist, change the password, run `docker compose up -d --force-recreat
 new one.
 
 Settings in `.env`: `NTOPNG_WEB_PORT` (default 3000), `NTOPNG_BIND` (`127.0.0.1`; set `0.0.0.0` for other machines and
-put TLS in front), `NTOPNG_REDIS_PORT` (6380), `NTOPNG_VERSION` (`stable`). Data lives in the volumes `librenms_ntopng`
+put TLS in front), `NTOPNG_REDIS_PORT` (6380), `NTOPNG_VERSION` (`latest`). Data lives in the volumes `librenms_ntopng`
 and `librenms_ntopng-redis`. `scripts/backup.*` does not include them: they hold traffic history and ntopng settings only.
 
 ### NetFlow / sFlow (NfSen)

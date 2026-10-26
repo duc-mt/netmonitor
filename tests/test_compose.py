@@ -128,7 +128,7 @@ def main():
               {"source": "nfsen", "target": "/data", "read_only": False, "nocopy": True} in mounts(everything[name]))
     perms = everything["nfsen-perms"]
     check("nfsen-perms has no network", perms.get("network_mode") == "none")
-    check("nfsen-perms switches the image's healthcheck off", (perms.get("healthcheck") or {}).get("disable") is True)
+    check("nfsen-perms has a minimal healthcheck", (perms.get("healthcheck") or {}).get("test") == ["CMD", "true"])
     check("nfsen sources default", everything["nfsen"]["environment"].get("NFSEN_SOURCES") == "router1,2055,#0000ff,netflow")
     other = render("netflow", {"NFSEN_IMAGE": "my-nfsen", "NFSEN_VERSION": "local"})["nfsen"]
     check("NFSEN_IMAGE and NFSEN_VERSION select the image", other["image"] == "my-nfsen:local", other["image"])
