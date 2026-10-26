@@ -90,11 +90,12 @@ install_linux() {
         $SUDO systemctl enable --now docker
     fi
 
-    # Add current non-root user to docker group if applicable
-    if [ "$(id -u)" -ne 0 ] && [ -n "${USER:-}" ]; then
-        info "Adding $USER to docker group..."
-        $SUDO usermod -aG docker "$USER" || true
-        info "Note: You may need to log out and log back in for docker group membership to take effect."
+    # Add the invoking user (or current user) to docker group so sudo is not needed
+    TARGET_USER="${SUDO_USER:-${USER:-}}"
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        info "Adding $TARGET_USER to docker group..."
+        $SUDO usermod -aG docker "$TARGET_USER" || true
+        info "Note: You may need to run 'newgrp docker' or log out and back in for docker group changes to apply."
     fi
 }
 

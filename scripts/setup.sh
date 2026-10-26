@@ -106,14 +106,33 @@ command -v docker >/dev/null 2>&1 \
   || die "Docker is not installed. Install Docker Desktop (macOS) or Docker Engine (Linux): https://docs.docker.com/get-docker/"
 docker compose version >/dev/null 2>&1 \
   || die "Docker Compose v2 is missing. Update Docker Desktop, or install the docker-compose-plugin package on Linux."
-docker info >/dev/null 2>&1 \
-  || die "The Docker daemon is not running. Start Docker Desktop (macOS) or run: sudo systemctl start docker (Linux)."
+if ! docker info >/dev/null 2>&1; then
+  # On Linux, try auto-starting docker service if systemctl is available
+  if command -v systemctl >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+    info "Attempting to start Docker service via systemctl..."
+    if [ "$(id -u)" -eq 0 ]; then
+      systemctl start docker || true
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo systemctl start docker || true
+    fi
+  fi
+fi
+
+# Determine if docker requires sudo wrapper in current session
+DOCKER_CMD="docker"
+if ! docker info >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+    DOCKER_CMD="sudo docker"
+  else
+    die "The Docker daemon is not running or accessible. Start Docker Desktop (macOS) or run: sudo systemctl start docker (Linux)."
+  fi
+fi
 
 info "Starting LibreNMS. The first start downloads the images and runs the database migrations, so it can take several minutes."
-if ! docker compose up -d --wait; then
+if ! $DOCKER_CMD compose up -d --wait; then
   echo >&2
-  docker compose ps >&2 || true
-  docker compose logs --tail 40 librenms >&2 || true
+  $DOCKER_CMD compose ps >&2 || true
+  $DOCKER_CMD compose logs --tail 40 librenms >&2 || true
   die "LibreNMS did not become healthy. See the log above, or run: docker compose logs -f"
 fi
 
