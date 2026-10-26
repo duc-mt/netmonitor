@@ -86,7 +86,17 @@ function Test-Native([string]$Exe, [string[]]$CmdArgs) {
 
 function Get-EnvValue([string]$Key) {
     $match = Select-String -Path (Join-Path $Root '.env') -Pattern "^$Key=(.*)$" | Select-Object -First 1
-    if ($match) { return $match.Matches[0].Groups[1].Value }
+    if ($match) {
+        $val = $match.Matches[0].Groups[1].Value.Trim()
+        if ($val.Length -ge 2) {
+            $first = $val.Substring(0, 1)
+            $last = $val.Substring($val.Length - 1)
+            if (($first -eq "'" -and $last -eq "'") -or ($first -eq '"' -and $last -eq '"')) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+        }
+        return $val
+    }
     return ''
 }
 
@@ -125,6 +135,7 @@ else {
     }
     # LF line endings and UTF-8 without a BOM: a BOM would corrupt the first variable name.
     [System.IO.File]::WriteAllText($envFile, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    if (-not $IsWindows -and (Get-Command chmod -ErrorAction SilentlyContinue)) { & chmod 600 $envFile 2>$null }
     Info "Created .env (timezone $tz, random database password and SNMP community)"
 }
 

@@ -13,23 +13,62 @@
   .\scripts\run.ps1 restore latest [-Yes]    # restore from .\backups: 'latest', a name or a file path
   .\scripts\run.ps1 validate                 # run LibreNMS' own self-check (validate.php)
   .\scripts\run.ps1 configure [-DryRun]     # apply the settings in .env to LibreNMS (workers, mail, NetFlow); safe to repeat
+  .\scripts\run.ps1 add-device <host> [opts] # add a device (e.g. .\scripts\run.ps1 add-device 192.168.1.1 -v 2c -c public)
+  .\scripts\run.ps1 scan <subnet> [options]  # auto-discover devices on subnet (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)
   .\scripts\run.ps1 update [-NoBackup]      # back up, pull newer images, restart, self-check
-  .\scripts\run.ps1 doctor                  # check the setup (Docker, .env, profiles, memory) before or after the first start
+  .\scripts\run.ps1 doctor [-Fix]           # check the setup (Docker, .env, profiles, memory); -Fix repairs permissions
 
 .NOTES
   If scripts are blocked:  powershell -ExecutionPolicy Bypass -File scripts\run.ps1 up
 #>
-[CmdletBinding()]
-param(
-    [Parameter(Position = 0)][string]$Command = 'help',
-    [Parameter(Position = 1)][string]$Name,
-    [int]$Keep = 0,
-    [switch]$Yes,
-    [switch]$DryRun,
-    [switch]$NoBackup,
-    [switch]$Fix,
-    [Parameter(ValueFromRemainingArguments = $true)][string[]]$ExtraArgs
-)
+$Command = 'help'
+$Name = ''
+$Keep = 0
+$Yes = $false
+$DryRun = $false
+$NoBackup = $false
+$Fix = $false
+$ExtraArgs = @()
+
+$rawArgs = @($args)
+if ($rawArgs.Count -gt 0 -and $rawArgs[0] -notmatch '^-') {
+    $Command = $rawArgs[0]
+    $rawArgs = @($rawArgs | Select-Object -Skip 1)
+}
+
+$i = 0
+while ($i -lt $rawArgs.Count) {
+    $arg = $rawArgs[$i]
+    switch -Regex ($arg) {
+        '^(-Command|--command)$' {
+            $i++
+            if ($i -lt $rawArgs.Count) { $Command = $rawArgs[$i] }
+        }
+        '^(-Command:)(.+)$' {
+            $Command = $Matches[2]
+        }
+        '^(-Keep|--keep)$' {
+            $i++
+            if ($i -lt $rawArgs.Count) { $Keep = [int]$rawArgs[$i] }
+        }
+        '^(-Keep:)(\d+)$' {
+            $Keep = [int]$Matches[2]
+        }
+        '^(-Yes|--yes|-y)$' { $Yes = $true }
+        '^(-DryRun|--dry-run)$' { $DryRun = $true }
+        '^(-NoBackup|--no-backup)$' { $NoBackup = $true }
+        '^(-Fix|--fix)$' { $Fix = $true }
+        default {
+            if (-not $Name -and $Command -in @('restart', 'logs', 'restore', 'add-device', 'scan') -and $arg -notmatch '^-') {
+                $Name = $arg
+            }
+            else {
+                $ExtraArgs += $arg
+            }
+        }
+    }
+    $i++
+}
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
@@ -52,8 +91,10 @@ function Show-Usage {
         '  .\scripts\run.ps1 restore latest [-Yes]    restore from .\backups: ''latest'', a name or a file path'
         '  .\scripts\run.ps1 validate                 run LibreNMS'' own self-check (validate.php)'
         '  .\scripts\run.ps1 configure [-DryRun]     apply the settings in .env to LibreNMS (workers, mail, NetFlow); safe to repeat'
+        '  .\scripts\run.ps1 add-device <host> [opts] add a device (e.g. .\scripts\run.ps1 add-device 192.168.1.1 -v 2c -c public)'
+        '  .\scripts\run.ps1 scan <subnet> [options]  auto-discover subnet devices via SNMP (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)'
         '  .\scripts\run.ps1 update [-NoBackup]      back up, pull newer images, restart, self-check'
-        '  .\scripts\run.ps1 doctor                  check the setup (Docker, .env, profiles, memory) before or after the first start'
+        '  .\scripts\run.ps1 doctor [-Fix]           check setup (Docker, .env, profiles, memory); -Fix repairs .env permissions'
     ) | ForEach-Object { Write-Host $_ }
 }
 
@@ -270,6 +311,23 @@ function Invoke-Doctor {
     else { Write-Check 'ok' 'MYSQL_PASSWORD is set' }
     if (-not (Get-Setting 'LIBRENMS_SNMP_COMMUNITY')) { Write-Check 'err' 'LIBRENMS_SNMP_COMMUNITY is empty: run scripts\setup.ps1' }
     else { Write-Check 'ok' 'LIBRENMS_SNMP_COMMUNITY is set' }
+    $onLinuxOrMac = $onLinux -or [bool](Get-Variable -Name IsMacOS -ValueOnly -ErrorAction SilentlyContinue)
+    if ($onLinuxOrMac -and (Test-Path -LiteralPath (Join-Path $Root '.env'))) {
+        $envPath = Join-Path $Root '.env'
+        $permCheck = & find $envPath -perm -004 -print 2>$null
+        if ($permCheck) {
+            if ($Fix) {
+                & chmod 600 $envPath 2>$null
+                Write-Check 'ok' '.env permissions fixed to 600 (-Fix)'
+            }
+            else {
+                Write-Check 'warn' '.env can be read by every user of this computer and it holds secrets: chmod 600 .env (or run .\scripts\run.ps1 doctor -Fix)'
+            }
+        }
+        else {
+            Write-Check 'ok' '.env is private to you'
+        }
+    }
 
     Write-Host 'Profiles'
     $profileList = @((((Get-Setting 'COMPOSE_PROFILES') -replace '\s', '') -split ',') | Where-Object { $_ })
@@ -426,7 +484,7 @@ function Invoke-Doctor {
 }
 
 if (@('help', '--help', '-h', '/?') -contains $Command) { Show-Usage; exit 0 }
-if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor') -notcontains $Command) {
+if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan') -notcontains $Command) {
     Write-Host "error: unknown command: $Command" -ForegroundColor Red
     Show-Usage
     exit 2
@@ -444,7 +502,10 @@ try {
     $code = 0
     switch ($Command) {
         'up'      { $code = (Invoke-Docker @('compose', 'up', '-d')).Code }
-        'down'    { $code = (Invoke-Docker @('compose', 'down')).Code }
+        'down' {
+            if ($Name -or $ExtraArgs.Count -gt 0) { Fail 'down takes no options: it never deletes the data volumes (run ''docker compose down -v'' yourself if you really want that)' }
+            $code = (Invoke-Docker @('compose', 'down')).Code
+        }
         'status'  { $code = (Invoke-Docker @('compose', 'ps')).Code }
         'restart' {
             $dockerArgs = @('compose', 'restart')

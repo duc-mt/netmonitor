@@ -59,7 +59,7 @@ Running the script again is safe: an existing `.env` is kept, and so are its sec
 One launcher wraps the common tasks, with the same verbs on every platform:
 
 ```bash
-./run up                    # start the stack              (Windows: .\scripts\run.ps1 up or scripts\run.bat up)
+./run up                    # start the stack              (Windows: .\run.ps1 up, run.cmd up, or .\scripts\run.ps1 up)
 ./run down                  # stop it, the data is kept
 ./run restart [service]     # restart everything, or one service
 ./run logs [service]        # follow the logs (Ctrl-C to stop)
@@ -74,7 +74,7 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run doctor [--fix]        # check setup: Docker, .env, memory (--fix repairs .env permissions)
 ```
 
-It works from any directory (`./run up`). On Windows, use `scripts\run.bat up` (CMD) or `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use
+It works from any directory (`./run up`). On Windows, use `run.cmd up` / `scripts\run.bat up` (CMD) or `.\run.ps1 up` / `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use
 `powershell -ExecutionPolicy Bypass -File scripts\run.ps1 up`. `down` never deletes the data volumes.
 
 The plain Compose commands work everywhere too:
@@ -330,8 +330,8 @@ settings persist, change the password, run `docker compose up -d --force-recreat
 new one.
 
 Settings in `.env`: `NTOPNG_WEB_PORT` (default 3000), `NTOPNG_BIND` (`127.0.0.1`; set `0.0.0.0` for other machines and
-put TLS in front), `NTOPNG_REDIS_PORT` (6380), `NTOPNG_VERSION` (`latest`). Data lives in the volumes `librenms_ntopng`
-and `librenms_ntopng-redis`. `scripts/backup.*` does not include them: they hold traffic history and ntopng settings only.
+put TLS in front), `NTOPNG_REDIS_PORT` (6380), `NTOPNG_VERSION` (`latest`). Data lives in the volumes `netmonitor_ntopng`
+and `netmonitor_ntopng-redis`. `scripts/backup.*` does not include them: they hold traffic history and ntopng settings only.
 
 ### NetFlow / sFlow (NfSen)
 
@@ -488,7 +488,7 @@ docker compose exec --user librenms librenms rrdtool info /netflow/nfsen/profile
 `docker compose exec nfsen chmod -R a+rX /data/nfsen/profiles-stat`. Do not enable `rrdcached` for LibreNMS: it
 cannot read files outside its own folder, a known cause of NfSen graph errors. This stack does not use it.
 
-**Data and disk.** Flows and RRD files live in the volume `librenms_nfsen`, which `scripts/backup.*` does not include
+**Data and disk.** Flows and RRD files live in the volume `netmonitor_nfsen`, which `scripts/backup.*` does not include
 (copy the volume yourself if you need it). Check the size and lifetime limits of the `live` profile in the NfSen UI:
 without a limit the flow files keep growing.
 
@@ -646,7 +646,7 @@ only as far as what is kept. Backups skip logs and cache, as described above.
   creates is the **container**, not your computer; add your computer by its IP address like any other device.
 - Docker Desktop (Windows, macOS) runs containers in a VM, and incoming syslog and trap packets can arrive with the
   VM's address instead of the sender's. If you rely on source addresses for syslog or traps, a Linux host avoids this.
-- Data lives in Docker **named volumes** (`librenms_db`, `librenms_data`), not in bind mounts. That avoids the slow
+- Data lives in Docker **named volumes** (`netmonitor_db`, `netmonitor_data`), not in bind mounts. That avoids the slow
   file sharing and permission problems that bind-mounted databases have on Windows and macOS.
   `docker compose down -v` deletes them.
 

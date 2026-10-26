@@ -32,7 +32,7 @@ if ($dockerCmd) {
 # Check if running with Administrator privileges
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Warn "Administrative privileges are recommended to install Docker Desktop on Windows."
+    Fail "Administrative privileges are required to install Docker Desktop on Windows. Please re-run this script in an elevated PowerShell window (Run as Administrator)."
 }
 
 # Check winget / choco

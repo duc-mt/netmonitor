@@ -73,9 +73,11 @@ install_linux() {
         curl -fsSL https://get.docker.com | $SUDO sh
     elif command -v dnf >/dev/null 2>&1; then
         info "Using DNF package manager (RHEL/CentOS/Fedora/Rocky/Alma)..."
+        $SUDO dnf install -y ca-certificates curl
         curl -fsSL https://get.docker.com | $SUDO sh
     elif command -v yum >/dev/null 2>&1; then
         info "Using YUM package manager..."
+        $SUDO yum install -y ca-certificates curl
         curl -fsSL https://get.docker.com | $SUDO sh
     elif command -v pacman >/dev/null 2>&1; then
         info "Using Pacman (Arch Linux)..."

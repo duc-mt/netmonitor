@@ -28,5 +28,6 @@ gunzip -c "$db_file" | mariadb "${client[@]}" "$db"
 echo "Restoring $DATA_DIR ..."
 find "$DATA_DIR" -mindepth 1 -delete
 tar xzf "$data_file" -C "$DATA_DIR"
+chown -R "${PUID:-1000}:${PGID:-1000}" "$DATA_DIR" 2>/dev/null || true
 
 echo "Restore complete."

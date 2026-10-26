@@ -145,6 +145,12 @@ jobs:
           ./scripts/run.ps1 bogus
           if ($LASTEXITCODE -ne 2) { throw "expected exit code 2, got $LASTEXITCODE" }
           $global:LASTEXITCODE = 0
+          ./scripts/run.ps1 add-device
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+          ./scripts/run.ps1 scan
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
 
       - name: scripts/run.ps1 launcher (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
@@ -153,6 +159,12 @@ jobs:
           .\scripts\run.ps1 help
           .\scripts\run.ps1 bogus
           if ($LASTEXITCODE -ne 2) { throw "expected exit code 2, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+          .\scripts\run.ps1 add-device
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1, got $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+          .\scripts\run.ps1 scan
+          if ($LASTEXITCODE -ne 1) { throw "expected exit code 1, got $LASTEXITCODE" }
           $global:LASTEXITCODE = 0
 
       - name: ./run configure --dry-run (Linux and macOS)

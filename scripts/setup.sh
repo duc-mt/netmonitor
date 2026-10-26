@@ -49,7 +49,13 @@ host_tz() {
 }
 
 read_env() {  # read_env KEY: value of KEY in .env (empty if missing)
-  grep -E "^$1=" .env | head -n 1 | cut -d= -f2- || true
+  local val
+  val=$(grep -E "^$1=" .env | head -n 1 | cut -d= -f2- || true)
+  case $val in
+    \'*\') val=${val#\'}; val=${val%\'} ;;
+    \"*\") val=${val#\"}; val=${val%\"} ;;
+  esac
+  printf '%s\n' "$val"
 }
 
 create_env() {
