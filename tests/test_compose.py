@@ -78,7 +78,8 @@ def main():
 
     DEFAULT = {"db", "redis", "librenms", "dispatcher"}
     EXTRA = {"syslog": {"syslogng"}, "traps": {"snmptrapd"}, "ntopng": {"ntopng", "ntopng-redis"},
-             "mail": {"msmtpd"}, "netflow": {"nfsen", "nfsen-perms"}, "tools": {"tools"}}
+             "mail": {"msmtpd"}, "netflow": {"nfsen", "nfsen-perms"}, "tools": {"tools"},
+             "grafana": {"grafana"}, "oxidized": {"oxidized"}, "smokeping": {"smokeping"}, "proxy": {"caddy"}}
 
     print("which services each profile adds")
     check("default stack", set(render("")) == DEFAULT, str(sorted(render(""))))
@@ -96,6 +97,21 @@ def main():
     check("no privileged service", not [n for n, s in everything.items() if s.get("privileged")])
     check("host networking only for ntopng and its Redis",
           sorted(n for n, s in everything.items() if s.get("network_mode") == "host") == ["ntopng", "ntopng-redis"])
+
+    print("grafana, oxidized, smokeping, proxy")
+    local = ("grafana", "oxidized", "smokeping")
+    check("web UIs without a login listen on localhost by default",
+          all(p["host_ip"] == "127.0.0.1" for n in local for p in everything[n]["ports"]),
+          str({n: everything[n]["ports"] for n in local}))
+    check("grafana does not collide with ntopng (host port 3000)",
+          all(int(p["published"]) != 3000 for p in everything["grafana"]["ports"]))
+    check("librenms mounts the Smokeping data read only at /smokeping",
+          {"source": "smokeping-data", "target": "/smokeping", "read_only": True, "nocopy": False}
+          in mounts(everything["librenms"]))
+    check("caddy publishes 80 and 443",
+          sorted(int(p["published"]) for p in everything["caddy"]["ports"]) == [80, 443])
+    check("oxidized renders its config from the template",
+          everything["oxidized"]["entrypoint"] == ["/bin/sh", "/oxidized/render-config.sh"])
 
     print("capabilities")
     caps = lambda name, key: set(everything[name].get(key) or [])

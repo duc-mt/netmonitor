@@ -331,7 +331,7 @@ function Invoke-Doctor {
 
     Write-Host 'Profiles'
     $profileList = @((((Get-Setting 'COMPOSE_PROFILES') -replace '\s', '') -split ',') | Where-Object { $_ })
-    $known = @('syslog', 'traps', 'ntopng', 'mail', 'netflow', 'tools')
+    $known = @('syslog', 'traps', 'ntopng', 'mail', 'netflow', 'grafana', 'oxidized', 'smokeping', 'proxy', 'tools')
     if ($profileList.Count -eq 0) {
         Write-Check 'info' 'no optional profile is enabled (COMPOSE_PROFILES is empty)'
     }
@@ -339,7 +339,7 @@ function Invoke-Doctor {
         Write-Check 'ok' ('enabled: ' + ($profileList -join ','))
         foreach ($p in $profileList) {
             if ($known -cnotcontains $p) {
-                Write-Check 'warn' "unknown profile '$p' in COMPOSE_PROFILES (known: syslog, traps, ntopng, mail, netflow, tools)"
+                Write-Check 'warn' "unknown profile '$p' in COMPOSE_PROFILES (known: syslog, traps, ntopng, mail, netflow, grafana, oxidized, smokeping, proxy, tools)"
             }
         }
     }

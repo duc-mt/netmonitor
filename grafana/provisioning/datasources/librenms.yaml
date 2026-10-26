@@ -1,0 +1,20 @@
+# Grafana datasource for the LibreNMS database (MariaDB). Values come from the grafana service environment
+# (compose.yaml), so no secret is stored here. Grafana reaches the database over the internal Docker network.
+apiVersion: 1
+
+datasources:
+  - name: LibreNMS
+    uid: librenms-db
+    type: mysql
+    access: proxy
+    url: db:3306
+    user: $__env{MYSQL_USER}
+    isDefault: true
+    editable: false
+    jsonData:
+      database: $__env{MYSQL_DATABASE}
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: $__env{MYSQL_PASSWORD}

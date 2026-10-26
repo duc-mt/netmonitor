@@ -265,7 +265,7 @@ doctor() {
 
   echo "Profiles"
   profiles=$(env_get COMPOSE_PROFILES | tr -d ' ')
-  known=" syslog traps ntopng mail netflow tools "
+  known=" syslog traps ntopng mail netflow grafana oxidized smokeping proxy tools "
   if [ -z "$profiles" ]; then
     d_info "no optional profile is enabled (COMPOSE_PROFILES is empty)"
   else
@@ -274,7 +274,7 @@ doctor() {
       [ -n "$p" ] || continue
       case $known in
         *" $p "*) ;;
-        *) d_warn "unknown profile '$p' in COMPOSE_PROFILES (known: syslog, traps, ntopng, mail, netflow, tools)" ;;
+        *) d_warn "unknown profile '$p' in COMPOSE_PROFILES (known: syslog, traps, ntopng, mail, netflow, grafana, oxidized, smokeping, proxy, tools)" ;;
       esac
     done <<<"$(printf '%s\n' "$profiles" | tr ',' '\n')"
   fi

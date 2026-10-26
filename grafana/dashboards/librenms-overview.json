@@ -1,0 +1,68 @@
+{
+  "uid": "librenms-overview",
+  "title": "LibreNMS Overview",
+  "tags": ["librenms", "netmonitor"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Devices up", "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COUNT(*) AS up FROM devices WHERE status = 1 AND disabled = 0" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Devices down", "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COUNT(*) AS down FROM devices WHERE status = 0 AND disabled = 0 AND ignore = 0" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Active alerts", "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COUNT(*) AS alerts FROM alerts WHERE state = 1" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Ports down (admin up)", "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COUNT(*) AS ports FROM ports WHERE ifAdminStatus = 'up' AND ifOperStatus = 'down' AND deleted = 0 AND disabled = 0" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 5, "type": "table", "title": "Devices currently down", "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT hostname, sysName, os, status_reason AS reason, last_polled FROM devices WHERE status = 0 AND disabled = 0 AND ignore = 0 ORDER BY hostname" } ]
+    },
+    {
+      "id": 6, "type": "table", "title": "Latest events", "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT e.datetime, d.hostname, e.type, e.message FROM eventlog e JOIN devices d ON d.device_id = e.device_id ORDER BY e.datetime DESC LIMIT 50" } ]
+    },
+    {
+      "id": 7, "type": "piechart", "title": "Devices by OS", "gridPos": { "h": 8, "w": 8, "x": 0, "y": 13 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT os, COUNT(*) AS devices FROM devices WHERE disabled = 0 GROUP BY os ORDER BY devices DESC" } ],
+      "options": { "reduceOptions": { "values": true, "calcs": [], "fields": "/^devices$/" }, "pieType": "pie", "legend": { "displayMode": "table", "placement": "right" } }
+    },
+    {
+      "id": 8, "type": "table", "title": "Recently rebooted devices (last 24 h)", "gridPos": { "h": 8, "w": 16, "x": 8, "y": 13 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT hostname, sysName, uptime AS uptime_seconds, last_polled FROM devices WHERE uptime < 86400 AND uptime > 0 AND disabled = 0 ORDER BY uptime" } ]
+    }
+  ]
+}

@@ -235,8 +235,12 @@ Set `COMPOSE_PROFILES` in `.env`, then `docker compose up -d`:
 | `ntopng` | ntopng Community traffic analytics (Linux hosts only) | `NTOPNG_WEB_PORT` (3000, localhost only) |
 | `mail` | msmtpd relay for alert e-mail | none, internal only |
 | `netflow` | NetFlow/sFlow collector with NfSen, feeds the LibreNMS Netflow tab | UDP 2055-2064 (`NFSEN_FLOW_PORT_FIRST` to `_LAST`), web UI `NFSEN_WEB_PORT` (8080, localhost only) |
+| `grafana` | Grafana with the LibreNMS database as a ready datasource and a starter dashboard ([Grafana](#grafana)) | `GRAFANA_PORT` (3001, localhost only) |
+| `oxidized` | Oxidized configuration backups with git history, device list from LibreNMS; fallback for netops ([Oxidized](#oxidized-configuration-backups)) | `OXIDIZED_PORT` (8888, localhost only) |
+| `smokeping` | Smokeping latency and packet-loss graphs ([Smokeping](#smokeping)) | `SMOKEPING_PORT` (8085, localhost only) |
+| `proxy` | Caddy HTTPS front door for all of the above ([HTTPS](#https-reverse-proxy)) | 80 and 443 (`CADDY_HTTP_PORT`, `CADDY_HTTPS_PORT`) |
 
-Example: `COMPOSE_PROFILES=syslog,traps,ntopng,mail,netflow`. Point your devices at the host's address. The syslog and trap
+Example: `COMPOSE_PROFILES=syslog,traps,ntopng,mail,netflow,grafana,oxidized,smokeping,proxy`. ntopng and Grafana both default to port 3000 on the host; Grafana uses 3001 for that reason. Point your devices at the host's address. The syslog and trap
 receivers are published on every interface of the host, because devices have to reach them: see the next section to
 restrict who can send.
 
@@ -536,6 +540,74 @@ network, and the relay logs in to your real SMTP server. The SMTP login then liv
 The setup scripts do not generate SMTP values, and `SMTP_PASSWORD` is stored like the other secrets in `.env` (mode
 `600`, git-ignored). Put it in single quotes there if it contains `$` or `#`.
 
+### Grafana
+
+1. Set `COMPOSE_PROFILES=grafana` in `.env` (add to the others with commas), then `docker compose up -d`.
+2. Open <http://localhost:3001> and log in with `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` (default `admin` / `admin`;
+   **change it** in `.env` before the first start, or in the UI, before you publish the port).
+3. The *LibreNMS* datasource (MariaDB, over the internal network) and the *NetMonitor > LibreNMS Overview* dashboard
+   (devices up/down, alerts, ports down, events, devices by OS) are provisioned automatically from `grafana/`.
+   Put more dashboard JSON files into `grafana/dashboards/` and restart the service to load them.
+
+The datasource uses the same database login as LibreNMS. Grafana only runs SELECT queries from your panels, but anyone
+with the Grafana *Admin* role can run any SQL with that login, so keep that role to people you would trust with LibreNMS.
+
+### Oxidized (configuration backups)
+
+Oxidized is the always-on alternative to [netops](https://github.com/duc-mt/netops) for configuration backups: it
+fetches the device list from LibreNMS, logs in over SSH every hour and commits each change to a git repository.
+Use it when netops is not at hand.
+
+1. In LibreNMS create an API token (user menu > *API Settings*) and put it, plus the login Oxidized should use on your
+   devices, into `.env`: `OXIDIZED_LIBRENMS_TOKEN`, `OXIDIZED_USERNAME`, `OXIDIZED_PASSWORD`.
+2. Tell LibreNMS where Oxidized is, so its device pages get a *Config* tab:
+   ```bash
+   docker compose exec --user librenms librenms lnms config:set oxidized.enabled true
+   docker compose exec --user librenms librenms lnms config:set oxidized.url http://oxidized:8888
+   ```
+3. Set `COMPOSE_PROFILES=oxidized`, then `docker compose up -d`. Open <http://localhost:8888> for the node list; the
+   configurations are in the `oxidized` volume (`/data/configs.git` in the container).
+4. A device is backed up when its LibreNMS OS maps to an Oxidized model (LibreNMS has a mapping for the common ones; see
+   its *Oxidized Integration* documentation to add or exclude devices and groups).
+
+`oxidized/config.tmpl` is turned into the real configuration at each start by `oxidized/render-config.sh`; edit the
+template (not a file in the volume) for changes. The web UI has no login: keep `OXIDIZED_BIND=127.0.0.1`.
+This profile has not been run against real devices by the maintainers of this repository: try it on a lab device first.
+
+### netops inventory
+
+`scripts/netops-sync.sh` writes the LibreNMS network devices as the `inventory.csv` of [netops](https://github.com/duc-mt/netops):
+
+```bash
+scripts/netops-sync.sh --dry-run        # show the csv only
+scripts/netops-sync.sh                  # write ../netops/inventory.csv (the old file is kept as inventory.csv.bak)
+cd ../netops && ./run backup            # back up every device in it
+```
+
+Use `NETOPS_DIR` or `--output FILE` for another location. The stack must be running. Devices whose LibreNMS OS has no
+netops platform are listed and skipped; credentials stay in netops' own `.env`.
+
+### Smokeping
+
+1. Set `COMPOSE_PROFILES=smokeping`, then `docker compose up -d`. The web UI is at <http://localhost:8085>.
+2. Smokeping needs a target list. LibreNMS can generate one from its devices:
+   ```bash
+   docker compose exec --user librenms librenms lnms smokeping:generate --probes 10 --targets 10 --no-header \
+     > /tmp/Targets   # then copy it into the smokeping-config volume as /config/Targets
+   ```
+   Or edit `/config/Targets` in the `smokeping-config` volume by hand (see the image documentation).
+3. For latency graphs on the LibreNMS device pages, the RRD files are already mounted read only at `/smokeping` in the
+   `librenms` service. Set:
+   ```bash
+   docker compose exec --user librenms librenms lnms config:set smokeping.integration true
+   docker compose exec --user librenms librenms lnms config:set smokeping.dir /smokeping
+   docker compose exec --user librenms librenms lnms config:set smokeping.url http://localhost:8085/
+   ```
+   LibreNMS expects the file names of its own generated target list, so use that list (step 2).
+
+The Smokeping web UI has no login: keep `SMOKEPING_BIND=127.0.0.1`. These steps follow the LibreNMS Smokeping
+documentation and have not been exercised against a running stack here.
+
 ## HTTPS (reverse proxy)
 
 To serve LibreNMS to other machines, keep `LIBRENMS_BIND=127.0.0.1` (the default) so that the web UI is reachable only
@@ -576,6 +648,14 @@ Run `docker compose up -d`, watch `docker compose logs -f caddy` until the certi
 `https://librenms.example.com`. LibreNMS needs no setting for this: it is served at the root of the name. If it shows
 the proxy's address as the client address, add the proxy to LibreNMS' trusted proxies setting (see the upstream
 documentation on reverse proxies).
+
+**All services at once: the `proxy` profile.** Instead of writing your own override, set `COMPOSE_PROFILES=proxy` (plus
+the services you use) and `docker compose up -d`. `caddy/Caddyfile` then serves one name per service, taken from
+`CADDY_LIBRENMS_HOST`, `CADDY_GRAFANA_HOST`, `CADDY_OXIDIZED_HOST` and `CADDY_SMOKEPING_HOST` in `.env`
+(defaults `nms.localhost`, `grafana.localhost`, ...: these get a certificate from Caddy's own CA, so the browser warns
+until you trust it). Use real names with public DNS for Let's Encrypt. Oxidized and Smokeping have no login, so Caddy
+answers 403 to addresses outside the private ranges. Keep every `*_BIND` at `127.0.0.1` so the proxy is the only way in.
+Do not combine this profile with the `compose.override.yaml` Caddy above: both would publish ports 80 and 443.
 
 **Nginx** works the same way (`proxy_pass http://librenms:8000;` with `proxy_set_header Host $host;`,
 `X-Forwarded-For $proxy_add_x_forwarded_for` and `X-Forwarded-Proto $scheme`), but it does not fetch certificates
@@ -715,7 +795,7 @@ until they have passed once, so remove that setting from `.github/workflows/ci.y
 ## Repository layout
 
 ```
-compose.yaml                 the stack (web, dispatcher, db, redis, optional syslog/traps/ntopng/mail/netflow, tools helper)
+compose.yaml                 the stack (web, dispatcher, db, redis, optional syslog/traps/ntopng/mail/netflow/grafana/oxidized/smokeping/proxy, tools helper)
 .env.example                 template; scripts/setup.* turn it into .env
 run                          universal cross-platform launcher (delegates to scripts/run.sh or scripts/run.bat)
 scripts/run.sh               Bash launcher: up, down, restart, logs, status, backup, restore, validate, configure, update, doctor
@@ -725,6 +805,10 @@ scripts/setup.sh|ps1         create .env with random secrets and start
 scripts/backup.sh|ps1        back up database and data
 scripts/restore.sh|ps1       restore from a backup
 scripts/container/*.sh       the logic that runs inside the helper container
+scripts/netops-sync.sh       write the LibreNMS devices as a netops inventory.csv
+grafana/                     datasource and dashboard provisioning, dashboards (grafana profile)
+oxidized/                    config template and start script (oxidized profile)
+caddy/Caddyfile              reverse proxy routes (proxy profile)
 tests/                       script tests with a fake docker, run by tests/all.sh and by CI
 .github/workflows/ci.yml     tests on Linux, macOS, Windows
 ```

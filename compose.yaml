@@ -107,6 +107,8 @@ services:
       # RRD files written by the optional "netflow" profile, read only: LibreNMS just draws them in the device
       # "Netflow" tab. The volume is empty, and the mount harmless, while that profile is not used.
       - nfsen:/netflow:ro
+      # Smokeping RRD files (profile "smokeping"), read only. Empty and harmless while that profile is not used.
+      - smokeping-data:/smokeping:ro
     environment:
       <<: *librenms-env
     depends_on:
@@ -138,7 +140,7 @@ services:
       redis:
         condition: service_healthy
 
-  # ---- optional, enable with COMPOSE_PROFILES=syslog,traps,ntopng,mail,netflow in .env -----
+  # ---- optional, enable with COMPOSE_PROFILES=syslog,traps,ntopng,mail,netflow,grafana,oxidized,smokeping,proxy in .env -----
   syslogng:
     <<: *librenms-service
     profiles: ["syslog"]
@@ -352,6 +354,116 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
+  # ---- dashboards: Grafana (profile "grafana") ----
+  # Reads the LibreNMS database over the internal network (datasource provisioned from ./grafana/provisioning, no
+  # secret stored in a file) and loads the dashboards in ./grafana/dashboards. Localhost only by default.
+  grafana:
+    image: grafana/grafana-oss:${GRAFANA_VERSION:-11.2.0}
+    profiles: ["grafana"]
+    hostname: grafana
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
+    environment:
+      TZ: ${TZ:-UTC}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Read by the datasource provisioning file as $__env{...}.
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-librenms}
+      MYSQL_USER: ${MYSQL_USER:-librenms}
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:-}"
+    volumes:
+      - grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---- configuration backups: Oxidized (profile "oxidized"), the fallback for netops ----
+  # Takes its device list from the LibreNMS API (README, "Oxidized") and keeps every configuration in a git
+  # repository in the "oxidized" volume. oxidized/render-config.sh builds the config from oxidized/config.tmpl and
+  # the OXIDIZED_* values of .env at every start. Its REST API and web UI have no login: localhost only by default.
+  # Runs as root so the fresh volume is writable whatever user the image defaults to.
+  oxidized:
+    image: oxidized/oxidized:${OXIDIZED_VERSION:-latest}
+    profiles: ["oxidized"]
+    hostname: oxidized
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/oxidized/render-config.sh"]
+    ports:
+      - "${OXIDIZED_BIND:-127.0.0.1}:${OXIDIZED_PORT:-8888}:8888"
+    environment:
+      TZ: ${TZ:-UTC}
+      OXIDIZED_HOME: /data/home
+      OXIDIZED_LIBRENMS_TOKEN: "${OXIDIZED_LIBRENMS_TOKEN:-}"
+      OXIDIZED_USERNAME: "${OXIDIZED_USERNAME:-}"
+      OXIDIZED_PASSWORD: "${OXIDIZED_PASSWORD:-}"
+    volumes:
+      - oxidized:/data
+      - ./oxidized/config.tmpl:/oxidized/config.tmpl:ro
+      - ./oxidized/render-config.sh:/oxidized/render-config.sh:ro
+    depends_on:
+      librenms:
+        condition: service_healthy
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---- latency and packet loss: Smokeping (profile "smokeping") ----
+  # Pings far more often than SNMP polling can. Its RRD files are mounted read only into the librenms service
+  # (/smokeping) for the LibreNMS Smokeping integration (README, "Smokeping"). No login: localhost only by default.
+  smokeping:
+    image: lscr.io/linuxserver/smokeping:${SMOKEPING_VERSION:-latest}
+    profiles: ["smokeping"]
+    hostname: smokeping
+    cap_add:
+      - NET_RAW
+    environment:
+      TZ: ${TZ:-UTC}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    ports:
+      - "${SMOKEPING_BIND:-127.0.0.1}:${SMOKEPING_PORT:-8085}:80"
+    volumes:
+      - smokeping-config:/config
+      - smokeping-data:/data
+    logging: *default-logging
+    restart: unless-stopped
+
+  # ---- HTTPS front door: Caddy (profile "proxy") ----
+  # One name per service (caddy/Caddyfile, names set in .env). Publishes ports 80 and 443; see the README
+  # "HTTPS (reverse proxy)" section. With this profile, set LIBRENMS_BIND and the other *_BIND values to 127.0.0.1.
+  caddy:
+    image: caddy:${CADDY_VERSION:-2-alpine}
+    profiles: ["proxy"]
+    environment:
+      CADDY_LIBRENMS_HOST: ${CADDY_LIBRENMS_HOST:-nms.localhost}
+      CADDY_GRAFANA_HOST: ${CADDY_GRAFANA_HOST:-grafana.localhost}
+      CADDY_OXIDIZED_HOST: ${CADDY_OXIDIZED_HOST:-oxidized.localhost}
+      CADDY_SMOKEPING_HOST: ${CADDY_SMOKEPING_HOST:-smokeping.localhost}
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data       # keeps the certificates, so restarts do not ask Let's Encrypt again
+      - caddy-config:/config
+    depends_on:
+      librenms:
+        condition: service_healthy
+    logging: *default-logging
+    restart: unless-stopped
+
   # ---- on-demand helper used by scripts/backup.* and scripts/restore.* -------
   # Same MariaDB image, so the client tools match the server. It mounts the data
   # volume and ./backups; the logic lives in scripts/container/*.sh so no shell
@@ -379,3 +491,9 @@ volumes:
   nfsen:          # read only in librenms, filled by the netflow profile
   ntopng:         # these two are only created when the ntopng profile is used
   ntopng-redis:
+  grafana:        # dashboards and users of the grafana profile
+  oxidized:       # git repository of device configurations (oxidized profile)
+  smokeping-config:
+  smokeping-data: # read only in librenms (/smokeping)
+  caddy-data:     # certificates (proxy profile)
+  caddy-config:

@@ -1,0 +1,41 @@
+---
+# Oxidized configuration template. The oxidized service in compose.yaml turns this into the real config at every
+# start, replacing the @...@ markers with values from .env. Do not put secrets in this file.
+interval: 3600
+use_syslog: false
+debug: false
+threads: 30
+timeout: 20
+retries: 3
+prompt: !ruby/regexp /^([\w.@()-]+[#>]\s?)$/
+rest: 0.0.0.0:8888
+next_adds_job: false
+vars: {}
+groups: {}
+models: {}
+pid: /data/oxidized.pid
+input:
+  default: ssh
+  debug: false
+  ssh:
+    secure: false
+output:
+  default: git
+  git:
+    user: Oxidized
+    email: oxidized@localhost
+    repo: /data/configs.git
+source:
+  default: http
+  http:
+    url: http://librenms:8000/api/v0/oxidized
+    scheme: http
+    secure: false
+    map:
+      name: hostname
+      model: os
+      group: group
+    headers:
+      X-Auth-Token: '@OXIDIZED_LIBRENMS_TOKEN@'
+username: '@OXIDIZED_USERNAME@'
+password: '@OXIDIZED_PASSWORD@'

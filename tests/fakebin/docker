@@ -7,6 +7,7 @@
 #   FAKE_UP_EXIT      exit code of "docker compose up -d --wait" (default 0)
 #   FAKE_FAIL_MATCH   any call containing this text fails with exit code 1
 #   FAKE_MEMTOTAL     what "docker info --format {{.MemTotal}}" prints, in bytes (default 8 GiB)
+#   FAKE_DB_ROWS      what a mariadb query through "compose exec -T db sh -c ..." prints (\n and \t are expanded)
 #   FAKE_SERVICES     what "docker compose config --services" lists (default: db redis librenms dispatcher)
 echo "$*" >> "${FAKE_LOG:?FAKE_LOG must be set}"
 case "$*" in
@@ -16,6 +17,7 @@ case "$*" in
   "compose version") echo "Docker Compose version v2.fake" ;;
   "compose config --services") echo "${FAKE_SERVICES:-db redis librenms dispatcher}" | tr ' ' '\n' ;;
   "compose ps --status running --services") echo "${FAKE_RUNNING-db redis librenms dispatcher}" | tr ' ' '\n' ;;
+  "compose exec -T db sh -c"*) printf '%b' "${FAKE_DB_ROWS:-}" ;;
   "compose images") echo "CONTAINER REPOSITORY TAG" ;;
   *config:get*) printf '%s\n' "${FAKE_CONFIG_GET:-}" ;;
   "compose up -d --wait") exit "${FAKE_UP_EXIT:-0}" ;;
