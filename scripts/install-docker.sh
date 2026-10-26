@@ -58,6 +58,14 @@ install_linux() {
 
     if command -v apt-get >/dev/null 2>&1; then
         info "Using APT package manager (Debian/Ubuntu/Raspbian)..."
+        if command -v fuser >/dev/null 2>&1; then
+            for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
+                while $SUDO fuser "$lock" >/dev/null 2>&1; do
+                    info "Waiting for background package manager/updates to release $lock..."
+                    sleep 3
+                done
+            done
+        fi
         $SUDO apt-get update -y
         $SUDO apt-get install -y ca-certificates curl gnupg
         
