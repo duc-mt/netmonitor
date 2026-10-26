@@ -538,6 +538,27 @@ network, and the relay logs in to your real SMTP server. The SMTP login then liv
 3. Test from the test button of a Mail transport under *Alerts > Alert Transports*. `docker compose logs msmtpd` shows
    the relay's side, including login errors from your SMTP server.
 
+### Telegram alerts
+
+LibreNMS natively supports push notifications directly to a Telegram group, channel, or personal chat. The `./run configure`
+launcher automates the setup:
+
+1. Create a bot using [@BotFather](https://t.me/BotFather) on Telegram to get a bot token (`TELEGRAM_BOT_TOKEN`).
+2. Add the bot to your target chat or group, send a message, and find your numeric chat ID (`TELEGRAM_CHAT_ID`) using [@userinfobot](https://t.me/userinfobot) or [@RawDataBot](https://t.me/RawDataBot).
+3. Set the variables in `.env`:
+   ```bash
+   TELEGRAM_ENABLED=true
+   TELEGRAM_BOT_TOKEN="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
+   TELEGRAM_CHAT_ID="-1001234567890"
+   ```
+4. Apply the configuration to LibreNMS:
+   ```bash
+   ./run configure          # Windows: .\scripts\run.ps1 configure
+   ```
+   This automatically turns on Telegram alerting and writes the token and chat ID directly into the database.
+5. In the LibreNMS web interface, go to *Alerts > Alert Transports* to create/test a Telegram transport, or assign it to alert rules.
+
+
 The setup scripts do not generate SMTP values, and `SMTP_PASSWORD` is stored like the other secrets in `.env` (mode
 `600`, git-ignored). Put it in single quotes there if it contains `$` or `#`.
 
