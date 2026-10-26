@@ -10,7 +10,7 @@ What you get:
 - backup and restore scripts for every platform, and one launcher (`./run` / `scripts/run.bat` / `scripts/run.ps1`) for the everyday commands
 - optional syslog and SNMP trap receivers, outbound mail relay, ntopng traffic analytics (Linux hosts), and NetFlow/sFlow collector (NfSen)
 - built-in Grafana NOC dashboards, continuous Oxidized config archiving & in-browser visual diffs, Smokeping latency tracking, and Caddy HTTPS reverse proxy
-- automated inventory synchronization bridge to [netops](https://github.com/duc-mt/netops) (change management) and [netlog](https://github.com/duc-mt/netlog) (log buffer triage)
+- automated inventory synchronization bridge to [netops](https://github.com/duc-mt/netops) (change management & compliance audits)
 - CI that tests the scripts on Linux, macOS and Windows, and runs the full stack with a backup/restore cycle on Linux
 
 Based on the official example in [librenms/docker](https://github.com/librenms/docker/tree/master/examples/compose).
@@ -600,21 +600,19 @@ Oxidized powers the native **Config** tab and visual diff viewer inside LibreNMS
 template (not a file in the volume) for changes. The web UI has no login: keep `OXIDIZED_BIND=127.0.0.1`.
 This profile has not been run against real devices by the maintainers of this repository: try it on a lab device first.
 
-### netops & netlog inventory
+### netops inventory
 
-`scripts/netops-sync.sh` writes the LibreNMS network devices as the shared `inventory.csv` of
-[netops](https://github.com/duc-mt/netops) (change execution & audits) and [netlog](https://github.com/duc-mt/netlog) (log buffer monitoring & auto-triage):
+`scripts/netops-sync.sh` writes the LibreNMS network devices as the `inventory.csv` of [netops](https://github.com/duc-mt/netops):
 
 ```bash
 scripts/netops-sync.sh --dry-run        # preview the csv without writing
-scripts/netops-sync.sh                  # writes ../netops/inventory.csv and ../netlog/inventory.csv
+scripts/netops-sync.sh                  # writes ../netops/inventory.csv (the old file is kept as inventory.csv.bak)
 cd ../netops && ./run backup            # run on-demand netops backup
-cd ../netlog && ./run                   # run netlog buffer poll & triage
 ```
 
-Use `NETOPS_DIR`, `NETLOG_DIR`, `--netops-output FILE`, `--netlog-output FILE`, or `--only netops|netlog` to customize
-targets. The stack must be running. Existing ports, credential groups, and jump hosts are preserved across syncs. Devices
-whose LibreNMS OS has no supported platform are skipped; credentials stay in each tool's own `.env`.
+Use `NETOPS_DIR` or `--output FILE` to customize the destination file. The stack must be running. Existing ports and
+credential groups are preserved across syncs. Devices whose LibreNMS OS has no supported platform are skipped;
+credentials stay in netops' own `.env`.
 
 ### Smokeping
 
