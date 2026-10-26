@@ -8,8 +8,9 @@ What you get:
 - the official LibreNMS image, MariaDB, Redis and the dispatcher that actually runs the pollers
 - one setup script per platform that generates all secrets (nothing is hard-coded, nothing secret is committed)
 - backup and restore scripts for every platform, and one launcher (`./run` / `scripts/run.bat` / `scripts/run.ps1`) for the everyday commands
-- optional syslog and SNMP trap receivers, an optional outbound mail relay, optional ntopng traffic analytics (Linux hosts), and an optional NetFlow/sFlow collector (NfSen) that feeds a
-  Netflow tab in LibreNMS
+- optional syslog and SNMP trap receivers, outbound mail relay, ntopng traffic analytics (Linux hosts), and NetFlow/sFlow collector (NfSen)
+- built-in Grafana NOC dashboards, continuous Oxidized config archiving & in-browser visual diffs, Smokeping latency tracking, and Caddy HTTPS reverse proxy
+- automated inventory synchronization bridge to [netops](https://github.com/duc-mt/netops) (change management) and [netlog](https://github.com/duc-mt/netlog) (log buffer triage)
 - CI that tests the scripts on Linux, macOS and Windows, and runs the full stack with a backup/restore cycle on Linux
 
 Based on the official example in [librenms/docker](https://github.com/librenms/docker/tree/master/examples/compose).
@@ -820,31 +821,6 @@ tests/                       script tests with a fake docker, run by tests/all.s
 .github/workflows/ci.yml     tests on Linux, macOS, Windows
 ```
 
-## Publish this repository to GitHub
-
-```bash
-git init -b main
-git add .
-git status                    # check: .env and backups/ must NOT be listed
-git commit -m "LibreNMS on Docker"
-```
-
-With the [GitHub CLI](https://cli.github.com/):
-
-```bash
-gh repo create librenms-docker --private --source=. --push
-```
-
-Or create an empty repository on github.com and:
-
-```bash
-git remote add origin https://github.com/<you>/librenms-docker.git
-git push -u origin main
-```
-
-The CI workflow starts on the first push (*Actions* tab). Keep the repository **private** if your `compose.yaml`
-ever gains site-specific details. The files here contain no secrets.
-
 ## Credits and licence
 
 This project only wires together the upstream images
@@ -852,5 +828,7 @@ This project only wires together the upstream images
 [Redis](https://hub.docker.com/_/redis), and for the optional parts [ntopng](https://hub.docker.com/r/ntop/ntopng),
 [nfdump](https://github.com/phaag/nfdump) and [NfSen](https://github.com/phaag/nfsen) (in the community image
 [docker-nfsen](https://github.com/rguaitanele/docker-nfsen)),
-[msmtpd](https://hub.docker.com/r/crazymax/msmtpd) and [Caddy](https://hub.docker.com/_/caddy)). LibreNMS is GPL-licensed; see the upstream projects for their terms. Add a
+[msmtpd](https://hub.docker.com/r/crazymax/msmtpd), [Caddy](https://hub.docker.com/_/caddy),
+[Grafana](https://hub.docker.com/r/grafana/grafana-oss), [Oxidized](https://hub.docker.com/r/oxidized/oxidized), and
+[Smokeping](https://hub.docker.com/r/linuxserver/smokeping)). LibreNMS is GPL-licensed; see the upstream projects for their terms. Add a
 licence file of your choice for the scripts and configuration in this repository.
