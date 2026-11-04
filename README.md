@@ -60,7 +60,7 @@ Running the script again is safe: an existing `.env` is kept, and so are its sec
 One launcher wraps the common tasks, with the same verbs on every platform:
 
 ```bash
-./run up                    # start the stack              (Windows: .\run.ps1 up, run.cmd up, or .\scripts\run.ps1 up)
+./run up                    # start the stack              (Windows: .\scripts\run.ps1 up or scripts\run.bat up)
 ./run down                  # stop it, the data is kept
 ./run restart [service]     # restart everything, or one service
 ./run logs [service]        # follow the logs (Ctrl-C to stop)
@@ -76,7 +76,7 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run doctor [--fix]        # check setup: Docker, .env, memory (--fix repairs .env permissions)
 ```
 
-It works from any directory (`./run up`). On Windows, use `run.cmd up` / `scripts\run.bat up` (CMD) or `.\run.ps1 up` / `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use
+It works from any directory (`./run up`). On Windows, use `scripts\run.bat up` (CMD) or `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use
 `powershell -ExecutionPolicy Bypass -File scripts\run.ps1 up`. `down` never deletes the data volumes.
 
 The plain Compose commands work everywhere too:
