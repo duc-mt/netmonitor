@@ -59,7 +59,7 @@ while ($i -lt $rawArgs.Count) {
         '^(-NoBackup|--no-backup)$' { $NoBackup = $true }
         '^(-Fix|--fix)$' { $Fix = $true }
         default {
-            if (-not $Name -and $Command -in @('restart', 'logs', 'restore', 'add-device', 'scan') -and $arg -notmatch '^-') {
+            if (-not $Name -and $Command -in @('restart', 'logs', 'restore', 'add-device', 'scan', 'lnms') -and $arg -notmatch '^-') {
                 $Name = $arg
             }
             else {
@@ -95,6 +95,7 @@ function Show-Usage {
         '  .\scripts\run.ps1 scan <subnet> [options]  auto-discover subnet devices via SNMP (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)'
         '  .\scripts\run.ps1 update [-NoBackup]      back up, pull newer images, restart, self-check'
         '  .\scripts\run.ps1 doctor [-Fix]           check setup (Docker, .env, profiles, memory); -Fix repairs .env permissions'
+        '  .\scripts\run.ps1 lnms [args...]          run LibreNMS CLI commands (e.g. .\scripts\run.ps1 lnms user:add <user> -r admin)'
     ) | ForEach-Object { Write-Host $_ }
 }
 
@@ -147,7 +148,7 @@ function Invoke-Lnms([string[]]$LnmsArgs, [switch]$Capture) {
         Write-Host ('lnms ' + ($LnmsArgs -join ' '))
         return [pscustomobject]@{ Code = 0; Output = @() }
     }
-    $dockerArgs = @('compose', 'exec', '-T', '--user', 'librenms', 'librenms', 'lnms') + $LnmsArgs
+    $dockerArgs = @('compose', 'exec', '-T', 'librenms', 'su', '-s', '/bin/sh', 'librenms', '-c', 'php /opt/librenms/lnms "$@"', '--', 'lnms') + $LnmsArgs
     return Invoke-Docker $dockerArgs -Capture:$Capture
 }
 
@@ -484,7 +485,7 @@ function Invoke-Doctor {
 }
 
 if (@('help', '--help', '-h', '/?') -contains $Command) { Show-Usage; exit 0 }
-if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan') -notcontains $Command) {
+if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan', 'lnms') -notcontains $Command) {
     Write-Host "error: unknown command: $Command" -ForegroundColor Red
     Show-Usage
     exit 2
@@ -537,6 +538,14 @@ try {
             $argsList = @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'php', 'addhost.php', $Name)
             if ($ExtraArgs) { $argsList += $ExtraArgs }
             $code = (Invoke-Docker $argsList).Code
+        }
+        'lnms' {
+            $cmdArgs = @()
+            if ($Name) { $cmdArgs += $Name }
+            if ($ExtraArgs) { $cmdArgs += $ExtraArgs }
+            if ($cmdArgs.Count -eq 0) { Fail 'usage: .\scripts\run.ps1 lnms <command> [options] (e.g. .\scripts\run.ps1 lnms user:add <user> -r admin)' }
+            $dockerArgs = @('compose', 'exec', '-T', 'librenms', 'su', '-s', '/bin/sh', 'librenms', '-c', 'php /opt/librenms/lnms "$@"', '--', 'lnms') + $cmdArgs
+            $code = (Invoke-Docker $dockerArgs).Code
         }
         'scan' {
             if (-not $Name) { Fail 'usage: .\scripts\run.ps1 scan <subnet> [options] (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)' }

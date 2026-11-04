@@ -71,6 +71,7 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run configure             # apply the settings in .env to LibreNMS; safe to repeat (--dry-run: only show)
 ./run add-device <host>     # add a device (e.g. ./run add-device 192.168.1.1 -v 2c -c public)
 ./run scan <subnet>         # auto-discover subnet devices via SNMP (e.g. ./run scan 192.168.1.0/24)
+./run lnms [command]        # run LibreNMS CLI commands (e.g. ./run lnms user:add <user> -r admin)
 ./run update                # back up, pull newer images, restart, self-check (--no-backup skips the backup)
 ./run doctor [--fix]        # check setup: Docker, .env, memory (--fix repairs .env permissions)
 ```
@@ -91,9 +92,13 @@ docker compose pull && docker compose up -d --wait     # update to the newest im
 LibreNMS command line and self-check:
 
 ```bash
-docker compose exec --user librenms librenms lnms          # list commands
-docker compose exec --user librenms -w /opt/librenms librenms php validate.php
+./run lnms                                                 # list commands
+./run lnms user:add <username> -p <password> -r admin      # add an admin user
+./run validate                                             # run self-check (validate.php)
 ```
+
+> **Note on direct `docker compose exec` on macOS & non-Linux hosts:**
+> The upstream LibreNMS image switches privileges using `gosu`. On macOS / Docker Desktop where host GIDs differ from the container group (`librenms`), running `docker compose exec --user librenms ...` fails with `operation not permitted`. Always prefer `./run lnms ...`, or directly invoke `docker compose exec librenms su -s /bin/sh librenms -c 'php /opt/librenms/lnms "$@"' -- lnms <args>`.
 
 `validate.php` may report warnings that do not apply to Docker (updates happen by pulling a new image).
 

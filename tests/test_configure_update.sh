@@ -13,7 +13,7 @@ run_code() {
 }
 has_line() { grep -Fxq -- "$1" out.txt; }       # an exact line of the output
 logged() { grep -Fxq -- "$1" "$FAKE_LOG"; }     # an exact docker call
-LNMS='compose exec -T --user librenms librenms lnms'
+LNMS='compose exec -T librenms su -s /bin/sh librenms -c php /opt/librenms/lnms "$@" -- lnms'
 
 echo "configure --dry-run without optional profiles"
 printf 'MYSQL_PASSWORD=test\nCOMPOSE_PROFILES=\n' > .env

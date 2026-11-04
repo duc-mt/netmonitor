@@ -14,6 +14,7 @@
 #   ./run scan <subnet>       auto-discover devices on a subnet using snmp-scan.py (e.g. 192.168.1.0/24)
 #   ./run update              back up, pull newer images, restart, self-check (--no-backup skips the backup)
 #   ./run doctor [--fix]      check setup (Docker, .env, profiles, memory); --fix auto-repairs .env permissions
+#   ./run lnms [args...]      run LibreNMS CLI commands (e.g. ./run lnms user:add <user> -r admin)
 #
 set -euo pipefail
 
@@ -21,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$ROOT_DIR"
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die() { echo "error: $*" >&2; exit 1; }
 
 cmd=${1:-help}
@@ -29,7 +30,7 @@ cmd=${1:-help}
 
 case "$cmd" in
   help|-h|--help) usage; exit 0 ;;
-  up|down|restart|logs|status|backup|restore|validate|configure|update|doctor|add-device|scan) ;;
+  up|down|restart|logs|status|backup|restore|validate|configure|update|doctor|add-device|scan|lnms) ;;
   *) echo "error: unknown command: $cmd" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -112,7 +113,7 @@ lnms_run() {
   if [ "$dry" -eq 1 ]; then
     echo "lnms $*"
   else
-    docker compose exec -T --user librenms librenms lnms "$@"
+    docker compose exec -T librenms su -s /bin/sh librenms -c 'php /opt/librenms/lnms "$@"' -- lnms "$@"
   fi
 }
 
@@ -459,4 +460,7 @@ case "$cmd" in
   configure) configure ;;
   update) update ;;
   doctor) doctor ;;
+  lnms)
+    [ $# -ge 1 ] || die "usage: ./run lnms <command> [options] (e.g. ./run lnms user:add <user> -r admin)"
+    docker compose exec -T librenms su -s /bin/sh librenms -c 'php /opt/librenms/lnms "$@"' -- lnms "$@" ;;
 esac
