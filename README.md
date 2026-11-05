@@ -49,7 +49,9 @@ The script creates `.env` with a random database password and SNMP community, de
 pulls the images and starts everything. The **first start takes several minutes** (image download and
 database migrations). When it finishes it prints the address, normally <http://localhost:8000>.
 
-1. Open the address. The first visit asks you to **create the admin account**.
+1. Open the address. The first visit asks you to **create the admin account**. To skip that step (unattended installs),
+   put `LIBRENMS_ADMIN_USER` and `LIBRENMS_ADMIN_PASSWORD` in `.env` and run `./run configure`: it creates the admin
+   account once the stack is up, and does nothing if the user already exists.
 2. Add a device: *Devices > Add Device*. Prefer **SNMPv3** (authPriv) over v2c where the device supports it.
 3. For discovering a whole network, follow the [Auto-Discovery docs](https://docs.librenms.org/Extensions/Auto-Discovery/).
 
@@ -72,8 +74,14 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run add-device <host>     # add a device (e.g. ./run add-device 192.168.1.1 -v 2c -c public)
 ./run scan <subnet>         # auto-discover subnet devices via SNMP (e.g. ./run scan 192.168.1.0/24)
 ./run lnms [command]        # run LibreNMS CLI commands (e.g. ./run lnms user:add <user> -r admin)
+./run user-add <user>       # create a user (-r admin|global-read|user, -e <email>, -p <password>); without -p a 24-character password is generated and shown once
+./run oxidized-setup [user] # pair Oxidized with LibreNMS: API token into .env, integration on (--force: new token)
+./run poll-device <host>    # poll one device now with full debug output (-vvv)
+./run snmp-walk <host> [oid]  # walk a device's SNMP tree from the LibreNMS container
+./run ping-device <host>    # check a device with LibreNMS' own ping check
+./run sync-inventory        # write the LibreNMS devices as the netops inventory.csv (see "netops inventory")
 ./run update                # back up, pull newer images, restart, self-check (--no-backup skips the backup)
-./run doctor [--fix]        # check setup: Docker, .env, memory (--fix repairs .env permissions)
+./run doctor [--fix]        # check setup: Docker, .env, memory, disk, poller backlog (--fix repairs .env permissions)
 ```
 
 It works from any directory (`./run up`). On Windows, use `scripts\run.bat up` (CMD) or `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use
@@ -93,12 +101,28 @@ LibreNMS command line and self-check:
 
 ```bash
 ./run lnms                                                 # list commands
-./run lnms user:add <username> -p <password> -r admin      # add an admin user
+./run user-add <username>                                  # add an admin user with a generated password
+./run user-add <username> -p <password> -r global-read     # or with your own password and another role
 ./run validate                                             # run self-check (validate.php)
 ```
 
+`user-add` prints a generated password once and stores it nowhere. The password is given to LibreNMS as a command-line
+argument, so other users of the same machine can see it while the command runs.
+
+Troubleshooting a device, all through the same container:
+
+```bash
+./run ping-device core-sw1                # does LibreNMS' own ping check reach it?
+./run snmp-walk core-sw1 1.3.6.1.2.1.1    # what does it answer over SNMP? (without an OID: the whole tree)
+./run poll-device core-sw1                # poll it now and show every step (debug output)
+```
+
+The host can be a host name, an IP address or a device id. `./run sync-inventory` takes the options of
+`scripts/netops-sync.sh` (see "netops inventory"); on Windows it needs `bash` (Git for Windows or WSL).
+
 > **Note on direct `docker compose exec` on macOS & non-Linux hosts:**
 > The upstream LibreNMS image switches privileges using `gosu`. On macOS / Docker Desktop where host GIDs differ from the container group (`librenms`), running `docker compose exec --user librenms ...` fails with `operation not permitted`. Always prefer `./run lnms ...`, or directly invoke `docker compose exec librenms su -s /bin/sh librenms -c 'php /opt/librenms/lnms "$@"' -- lnms <args>`.
+> `./run validate`, `add-device` and `scan` switch users the same way (the Windows launcher too).
 
 `validate.php` may report warnings that do not apply to Docker (updates happen by pulling a new image).
 
@@ -107,8 +131,11 @@ prints `ok`, `info`, `WARN` and `ERROR` lines; it exits 1 if there is any `ERROR
 that the secrets in `.env` are set (and, on Linux and macOS, that `.env` is private), that the enabled profiles are
 complete (the mail relay has an `SMTP_HOST`, the ntopng interface exists), that every `NFSEN_SOURCES` entry is valid
 (a name NfSen accepts, a port inside the published range, one port per device), that `MARIADB_BUFFER_POOL_SIZE` fits in
-the memory Docker has, which web UIs listen on every network, and whether the services are running. It does not check
-whether host ports are free.
+the memory Docker has, which web UIs listen on every network, whether the services are running, and, when they are,
+how full the disk is under the `data`, `db` and (with NetFlow) `nfsen` volumes and whether the poller has a backlog
+(devices not polled for 15 minutes, or taking longer than the 5-minute cycle). It warns above 80 % disk use or 50 GB
+for one volume; `DOCTOR_DISK_WARN_PCT` and `DOCTOR_VOLUME_WARN_GB` change those limits. It does not check whether host
+ports are free.
 
 **Updating.** `./run update` (Windows: `.\scripts\run.ps1 update`) lists the images in use and saves that list to
 `backups/update-<time>.txt`, backs up, pulls newer images (images you built yourself are skipped), restarts, and runs
@@ -276,7 +303,7 @@ published with `LIBRENMS_BIND=0.0.0.0`. Restrict them in one of two ways:
 ### Syslog
 
 1. Set `COMPOSE_PROFILES=syslog` in `.env`, then `docker compose up -d`.
-2. Turn syslog on in LibreNMS: `docker compose exec --user librenms librenms lnms config:set enable_syslog true`
+2. Turn syslog on in LibreNMS: `./run lnms config:set enable_syslog true`
    (or in the web UI under *Settings > Syslog*).
 3. Point the device's syslog target at the host, port 514. LibreNMS keeps messages only from devices it knows, matched
    by address, so add the device first.
@@ -435,11 +462,11 @@ profile on, it applies the settings below; list entries are added only when miss
 `--dry-run` only prints the commands. By hand, once, from the project folder:
 
 ```bash
-docker compose exec --user librenms librenms lnms config:set nfsen_enable true
-docker compose exec --user librenms librenms lnms config:set nfsen_split_char '_'
-docker compose exec --user librenms librenms lnms config:set nfsen_rrds.+ '/netflow/nfsen/profiles-stat/live/'
-docker compose exec --user librenms librenms lnms config:set nfsen_rrds.+ '/netflow/nfsen/profiles-stat'
-docker compose exec --user librenms librenms lnms config:set nfsen_base.+ '/netflow/nfsen/'
+./run lnms config:set nfsen_enable true
+./run lnms config:set nfsen_split_char '_'
+./run lnms config:set nfsen_rrds.+ '/netflow/nfsen/profiles-stat/live/'
+./run lnms config:set nfsen_rrds.+ '/netflow/nfsen/profiles-stat'
+./run lnms config:set nfsen_base.+ '/netflow/nfsen/'
 ```
 
 `.+` adds an entry to a list each time, so run the by-hand lines once (`lnms config:get nfsen_rrds` shows the result). The same settings
@@ -490,8 +517,8 @@ LibreNMS has no write access at all, so neither side can hit a permission error 
 LibreNMS sees:
 
 ```bash
-docker compose exec --user librenms librenms ls -l /netflow/nfsen/profiles-stat/live/
-docker compose exec --user librenms librenms rrdtool info /netflow/nfsen/profiles-stat/live/core_rtr.rrd
+docker compose exec librenms ls -l /netflow/nfsen/profiles-stat/live/
+docker compose exec librenms rrdtool info /netflow/nfsen/profiles-stat/live/core_rtr.rrd
 ```
 
 "Permission denied" on a graph: wait a minute for the helper, or run
@@ -531,11 +558,11 @@ network, and the relay logs in to your real SMTP server. The SMTP login then liv
    repeat, and `--dry-run` only prints the commands. By hand, the same is:
 
    ```bash
-   docker compose exec --user librenms librenms lnms config:set email_backend smtp
-   docker compose exec --user librenms librenms lnms config:set email_smtp_host msmtpd
-   docker compose exec --user librenms librenms lnms config:set email_smtp_port 2500
-   docker compose exec --user librenms librenms lnms config:set email_smtp_auth false
-   docker compose exec --user librenms librenms lnms config:set email_from "librenms@example.com"
+   ./run lnms config:set email_backend smtp
+   ./run lnms config:set email_smtp_host msmtpd
+   ./run lnms config:set email_smtp_port 2500
+   ./run lnms config:set email_smtp_auth false
+   ./run lnms config:set email_from "librenms@example.com"
    ```
 
    The same in the web UI (*Settings > Alerting > Email options*): backend `SMTP`, host `msmtpd`, port `2500`, no
@@ -589,14 +616,18 @@ Oxidized powers the native **Config** tab and visual diff viewer inside LibreNMS
 - **netops (CLI & Change Management)**: Handles on-demand CLI operations, batch configuration pushes, pre-flight safety
   checks, auto-rollbacks, and password/VLAN rotations.
 
-1. In LibreNMS create an API token (user menu > *API Settings*) and put it, plus the login Oxidized should use on your
-   devices, into `.env`: `OXIDIZED_LIBRENMS_TOKEN`, `OXIDIZED_USERNAME`, `OXIDIZED_PASSWORD`.
-2. Tell LibreNMS where Oxidized is, so its device pages get a *Config* tab:
+1. Put the login Oxidized should use on your devices into `.env`: `OXIDIZED_USERNAME`, `OXIDIZED_PASSWORD`, and set
+   `COMPOSE_PROFILES=oxidized` (then `./run up`).
+2. Run `./run oxidized-setup`. It creates a LibreNMS API token named `oxidized` for the user in `LIBRENMS_ADMIN_USER`
+   (or the user you name: `./run oxidized-setup <username>`; a user that does not exist is an error), saves it as
+   `OXIDIZED_LIBRENMS_TOKEN` in `.env`, and tells LibreNMS where Oxidized is, so that its device pages get a *Config* tab.
+   A token already in `.env` is kept; `--force` makes a new one. By hand, the same is: create the token in the web UI
+   (user menu > *API Settings*), put it in `.env`, and run
    ```bash
-   docker compose exec --user librenms librenms lnms config:set oxidized.enabled true
-   docker compose exec --user librenms librenms lnms config:set oxidized.url http://oxidized:8888
+   ./run lnms config:set oxidized.enabled true
+   ./run lnms config:set oxidized.url http://oxidized:8888
    ```
-3. Set `COMPOSE_PROFILES=oxidized`, then `docker compose up -d`. Open <http://localhost:8888> for the raw node list; the
+3. Restart Oxidized so that it reads the token: `./run restart oxidized`. Open <http://localhost:8888> for the raw node list; the
    configurations are in the `oxidized` volume (`/data/configs.git` in the container).
 4. A device is backed up when its LibreNMS OS maps to an Oxidized model (LibreNMS has a mapping for the common ones; see
    its *Oxidized Integration* documentation to add or exclude devices and groups).
@@ -624,16 +655,16 @@ credentials stay in netops' own `.env`.
 1. Set `COMPOSE_PROFILES=smokeping`, then `docker compose up -d`. The web UI is at <http://localhost:8085>.
 2. Smokeping needs a target list. LibreNMS can generate one from its devices:
    ```bash
-   docker compose exec --user librenms librenms lnms smokeping:generate --probes 10 --targets 10 --no-header \
+   ./run lnms smokeping:generate --probes 10 --targets 10 --no-header \
      > /tmp/Targets   # then copy it into the smokeping-config volume as /config/Targets
    ```
    Or edit `/config/Targets` in the `smokeping-config` volume by hand (see the image documentation).
 3. For latency graphs on the LibreNMS device pages, the RRD files are already mounted read only at `/smokeping` in the
    `librenms` service. Set:
    ```bash
-   docker compose exec --user librenms librenms lnms config:set smokeping.integration true
-   docker compose exec --user librenms librenms lnms config:set smokeping.dir /smokeping
-   docker compose exec --user librenms librenms lnms config:set smokeping.url http://localhost:8085/
+   ./run lnms config:set smokeping.integration true
+   ./run lnms config:set smokeping.dir /smokeping
+   ./run lnms config:set smokeping.url http://localhost:8085/
    ```
    LibreNMS expects the file names of its own generated target list, so use that list (step 2).
 
@@ -687,6 +718,26 @@ the services you use) and `docker compose up -d`. `caddy/Caddyfile` then serves 
 (defaults `nms.localhost`, `grafana.localhost`, ...: these get a certificate from Caddy's own CA, so the browser warns
 until you trust it). Use real names with public DNS for Let's Encrypt. Oxidized and Smokeping have no login, so Caddy
 answers 403 to addresses outside the private ranges. Keep every `*_BIND` at `127.0.0.1` so the proxy is the only way in.
+
+*Optional login for Oxidized and Smokeping.* To ask for a user name and password on those two names as well, make a
+bcrypt hash and put it in `.env`. The hash contains `$` characters, so it **must be in single quotes**, or Compose
+mangles it:
+
+```bash
+docker run --rm caddy:2-alpine caddy hash-password        # asks for the password, prints the hash
+```
+
+```
+OXIDIZED_AUTH_USER=ops
+OXIDIZED_AUTH_HASH='$2a$14$...'
+SMOKEPING_AUTH_USER=ops
+SMOKEPING_AUTH_HASH='$2a$14$...'
+```
+
+Then `docker compose up -d` (Caddy reads these when it starts). Each name is protected on its own, and the check is off
+while its `*_AUTH_USER` is empty. A user without a hash means that nobody can log in. `./run doctor` warns about that and
+about a hash that does not look like bcrypt. This login sits on top of the private-network rule, over HTTPS; the direct
+ports (`OXIDIZED_PORT`, `SMOKEPING_PORT`) have no login, so keep them on `127.0.0.1`.
 Do not combine this profile with the `compose.override.yaml` Caddy above: both would publish ports 80 and 443.
 
 **Nginx** works the same way (`proxy_pass http://librenms:8000;` with `proxy_set_header Host $host;`,
@@ -703,15 +754,21 @@ Set these in `.env`, then `docker compose up -d` (MariaDB restarts for a moment)
 | `MARIADB_BUFFER_POOL_SIZE` | `512M` | RAM that MariaDB uses to cache tables and indexes. Raise it on a large installation (for example `2G`), lower it on a small VM, and keep it below the memory Docker may use (Docker Desktop: *Settings > Resources*). |
 | `MARIADB_MAX_CONNECTIONS` | `250` | Simultaneous database connections. Raise it if LibreNMS logs "Too many connections". |
 | `DISPATCHER_WORKERS` | `8` | Poller workers: how many devices are polled at the same time. |
+| `SYSLOG_PURGE_DAYS` | `30` | Days of syslog messages LibreNMS keeps. Applied by `./run configure`. |
+| `EVENTLOG_PURGE_DAYS` | `90` | Days of event log entries LibreNMS keeps. Applied by `./run configure`. |
 
 `DISPATCHER_WORKERS` is handed to the dispatcher container. LibreNMS itself keeps the worker count in its own setting
 `service_poller_workers` (*Settings > Poller*), and whether an image version honours the variable depends on that
 image. So `./run configure` also writes the number there; then run `./run restart dispatcher`. By hand:
 
 ```bash
-docker compose exec --user librenms librenms lnms config:set service_poller_workers 8
+./run lnms config:set service_poller_workers 8
 docker compose restart dispatcher
 ```
+
+The two retention settings are written to LibreNMS' own `syslog_purge` and `eventlog_purge` by `./run configure`
+(whole days; LibreNMS' daily cleanup does the deleting). They do not need a restart. Syslog and the event log are
+usually what makes the database grow fastest on a busy network, so lower them if `./run doctor` warns about disk use.
 
 Fixed settings, chosen for LibreNMS' many small writes. `innodb_flush_log_at_trx_commit=2` writes the database log to
 disk once a second instead of at every commit, which removes most of the disk writes. The price: a power failure or an
@@ -814,9 +871,10 @@ checked anywhere bash runs.
 
 | File | What it checks |
 |---|---|
-| `tests/test_launcher.sh` | Each `run` verb issues the right command, mistakes are refused, `restore` accepts every way of naming a backup. |
-| `tests/test_configure_update.sh` | `configure` (settings from `.env`, whole-entry matching, safe to repeat) and `update` (backup first, then pull and restart). |
-| `tests/test_doctor.sh` | `doctor` finds bad `NFSEN_SOURCES` entries, missing secrets, memory problems and exposed web UIs, and stays quiet on a healthy setup. |
+| `tests/test_launcher.sh` | Each `run` verb issues the right command (always through `su -s /bin/sh librenms`), the diagnostic verbs and `user-add` (generated passwords included), mistakes are refused, `restore` accepts every way of naming a backup. |
+| `tests/test_configure_update.sh` | `configure` (settings from `.env`, retention, the headless admin account, whole-entry matching, safe to repeat), `oxidized-setup` and `update` (backup first, then pull and restart). |
+| `tests/test_doctor.sh` | `doctor` finds bad `NFSEN_SOURCES` entries, missing secrets, memory problems, exposed web UIs, full disks, big volumes, a poller backlog and bad proxy logins, and stays quiet on a healthy setup. |
+| `tests/test_caddyfile.sh` | The optional Basic Auth in `caddy/Caddyfile` and its wiring; with a `caddy` binary in the PATH it also validates the file and tries the login for real. |
 | `tests/test_backup_tar.sh` | The backup archive leaves out logs and cache and keeps everything else (needs GNU tar). |
 | `tests/test_compose.py` | The real `docker compose config` of every profile, and the shell scripts embedded in `compose.yaml`. Skipped without Docker. |
 
@@ -830,7 +888,7 @@ until they have passed once, so remove that setting from `.github/workflows/ci.y
 compose.yaml                 the stack (web, dispatcher, db, redis, optional syslog/traps/ntopng/mail/netflow/grafana/oxidized/smokeping/proxy, tools helper)
 .env.example                 template; scripts/setup.* turn it into .env
 run                          universal cross-platform launcher (delegates to scripts/run.sh or scripts/run.bat)
-scripts/run.sh               Bash launcher: up, down, restart, logs, status, backup, restore, validate, configure, update, doctor
+scripts/run.sh               Bash launcher: up, down, restart, logs, status, backup, restore, validate, configure, update, doctor, user-add, oxidized-setup, poll-device, snmp-walk, ping-device, sync-inventory
 scripts/run.bat              Windows CMD batch launcher (delegates to scripts/run.ps1)
 scripts/run.ps1              PowerShell launcher for Windows
 scripts/setup.sh|ps1         create .env with random secrets and start

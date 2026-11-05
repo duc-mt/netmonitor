@@ -157,6 +157,70 @@ NFSEN_SOURCES='a,2055,#0000ff,netflow'"
 check "NFSEN_BIND counts once the profile is on" said "NFSEN_BIND=0.0.0.0 serves every network"
 check "flow ports get a firewall reminder" said "open to every sender"
 
+echo "storage"
+doctor_with "$BASE"
+check "a healthy volume is reported" said "volume db: 1 GB, disk 10% full"
+check "the data volume is measured too" said "volume data: 1 GB, disk 10% full"
+if said "nfsen"; then fail "nfsen is only measured with the netflow profile"; else pass "nfsen is only measured with the netflow profile"; fi
+doctor_with "$BASE
+COMPOSE_PROFILES=netflow
+NFSEN_SOURCES='a,2055,#0000ff,netflow'"
+check "nfsen is measured with the netflow profile" said "volume nfsen:"
+doctor_with "$BASE"
+FAKE_DF='overlay 100000000 91000000 9000000 91% /var/lib/mysql\n1048576\n' ./run doctor >out.txt 2>err.txt || true
+check "a disk over 80% full is a warning" said "the disk holding it is 91% full (limit 80%)"
+doctor_with "$BASE
+DOCTOR_DISK_WARN_PCT=95"
+FAKE_DF='overlay 100000000 91000000 9000000 91% /x\n1048576\n' ./run doctor >out.txt 2>err.txt || true
+if said "is 91% full"; then fail "the disk limit can be raised"; else pass "the disk limit can be raised"; fi
+doctor_with "$BASE"
+FAKE_DF='overlay 900000000 10000000 890000000 2% /x\n62914560\n' ./run doctor >out.txt 2>err.txt || true
+check "a volume over 50 GB is a warning" said "60 GB is more than the 50 GB limit"
+doctor_with "$BASE
+DOCTOR_VOLUME_WARN_GB=100"
+FAKE_DF='overlay 900000000 10000000 890000000 2% /x\n62914560\n' ./run doctor >out.txt 2>err.txt || true
+if said "more than the"; then fail "the volume limit can be raised"; else pass "the volume limit can be raised"; fi
+doctor_with "$BASE"
+FAKE_DF='garbage' ./run doctor >out.txt 2>err.txt || true
+check "unreadable disk usage is only info" said "could not read its disk usage"
+FAKE_RUNNING='librenms' ./run doctor >out.txt 2>err.txt || true
+check "a volume whose service is stopped is not measured" said "volume db: not measured (db is not running)"
+
+echo "poller backlog"
+doctor_with "$BASE"
+check "no data from the database is only info" said "could not read the device poll times"
+FAKE_DB_ROWS='0\t0\n' ./run doctor >out.txt 2>err.txt || true
+check "an up-to-date poller is ok" said "every up device was polled within the last 15 minutes"
+FAKE_DB_ROWS='3\t0\n' ./run doctor >out.txt 2>err.txt || true
+check "late devices are a backlog warning" said "3 device(s) not polled for over 15 minutes (backlog)"
+check "the warning names the knobs" said "raise DISPATCHER_WORKERS (now 8)"
+FAKE_DB_ROWS='0\t2\n' ./run doctor >out.txt 2>err.txt || true
+check "slow devices are a warning" said "2 device(s) took longer than 300 s"
+FAKE_RUNNING='db redis librenms' ./run doctor >out.txt 2>err.txt || true
+check "a stopped dispatcher is a warning" said "the dispatcher is not running, so no device is polled"
+FAKE_RUNNING='' ./run doctor >out.txt 2>err.txt || true
+if said "Storage"; then fail "a stopped stack has no storage or poller section"; else pass "a stopped stack has no storage or poller section"; fi
+
+echo "proxy basic auth"
+PX="$BASE
+COMPOSE_PROFILES=proxy"
+doctor_with "$PX"
+if said "Basic Auth"; then fail "no auth settings: nothing to report"; else pass "no auth settings: nothing to report"; fi
+doctor_with "$PX
+OXIDIZED_AUTH_USER=ops
+OXIDIZED_AUTH_HASH='\$2a\$14\$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ0123456'"
+check "a bcrypt hash turns auth on" said "OXIDIZED: HTTP Basic Auth is on for user ops"
+doctor_with "$PX
+SMOKEPING_AUTH_USER=ops"
+check "a user without a hash is a warning" said "SMOKEPING_AUTH_USER is set but SMOKEPING_AUTH_HASH is empty"
+doctor_with "$PX
+OXIDIZED_AUTH_USER=ops
+OXIDIZED_AUTH_HASH=plaintext"
+check "a hash that is not bcrypt is a warning" said "OXIDIZED_AUTH_HASH does not look like a bcrypt hash"
+doctor_with "$BASE
+OXIDIZED_AUTH_USER=ops"
+if said "OXIDIZED_AUTH"; then fail "auth settings are ignored without the proxy profile"; else pass "auth settings are ignored without the proxy profile"; fi
+
 echo "options and environment"
 ./run doctor --bogus >out.txt 2>err.txt || code=$?
 equals "doctor takes no options (exit 2)" 2 "$code"

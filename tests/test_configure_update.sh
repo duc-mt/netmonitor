@@ -85,6 +85,69 @@ check "and the warning says so" grep -q 'rejected nfsen_base' err.txt
 FAKE_FAIL_MATCH='nfsen_enable' run_code configure
 equals "any other rejected setting is fatal" 1 "$code"
 
+echo "data retention"
+printf 'MYSQL_PASSWORD=test\nCOMPOSE_PROFILES=\n' > .env
+run_code configure --dry-run
+check "default syslog retention" has_line 'lnms config:set syslog_purge 30'
+check "default event log retention" has_line 'lnms config:set eventlog_purge 90'
+printf 'MYSQL_PASSWORD=test\nSYSLOG_PURGE_DAYS=7\nEVENTLOG_PURGE_DAYS=14\n' > .env
+run_code configure --dry-run
+check "syslog retention comes from .env" has_line 'lnms config:set syslog_purge 7'
+check "event log retention comes from .env" has_line 'lnms config:set eventlog_purge 14'
+printf 'MYSQL_PASSWORD=test\nSYSLOG_PURGE_DAYS=soon\n' > .env
+run_code configure --dry-run
+equals "a non-numeric retention exits 1" 1 "$code"
+check "and names the setting" grep -q 'SYSLOG_PURGE_DAYS' err.txt
+
+echo "headless admin account"
+printf 'MYSQL_PASSWORD=test\n' > .env
+run_code configure --dry-run
+check "no admin settings: skipped" grep -q 'LIBRENMS_ADMIN_USER is not set, skipped' out.txt
+printf 'MYSQL_PASSWORD=test\nLIBRENMS_ADMIN_USER=root1\nLIBRENMS_ADMIN_PASSWORD='"'"'S3cret!pass'"'"'\n' > .env
+run_code configure --dry-run
+check "dry run shows the user add" has_line 'lnms user:add root1 -p ******** -r admin'
+check "dry run does not print the password" test -z "$(grep 'S3cret' out.txt)"
+run_code configure
+equals "creates the admin account" 0 "$code"
+check "user:add gets the password from .env" logged "$LNMS user:add root1 -p S3cret!pass -r admin"
+check "says the account is ready" grep -q "Admin account 'root1' is ready" out.txt
+FAKE_USER_ADD_ERR='The username has already been taken.' run_code configure
+equals "an existing admin is not an error" 0 "$code"
+check "and is reported as ready" grep -q "Admin account 'root1' is ready" out.txt
+FAKE_USER_ADD_ERR='Password too weak' run_code configure
+equals "another failure is only a warning" 0 "$code"
+check "and shows the reason" grep -q 'Password too weak' err.txt
+printf 'MYSQL_PASSWORD=test\nLIBRENMS_ADMIN_USER=root1\n' > .env
+run_code configure --dry-run
+check "a user without a password is refused with a warning" grep -q 'must both be set' err.txt
+
+echo "oxidized-setup"
+printf 'MYSQL_PASSWORD=test\nCOMPOSE_PROFILES=\n' > .env
+run_code oxidized-setup
+equals "without the oxidized profile exits 1" 1 "$code"
+check "and says how to enable it" grep -q "profile 'oxidized' is not enabled" err.txt
+equals "and calls nothing" "" "$(calls)"
+printf 'MYSQL_PASSWORD=test\nCOMPOSE_PROFILES=oxidized\nOXIDIZED_LIBRENMS_TOKEN=\nOTHER=keep\n' > .env
+run_code oxidized-setup
+equals "exits 0" 0 "$code"
+check "creates the token for the default user" logged "$LNMS api:token-create --name=oxidized librenms"
+check "saves the token in .env" grep -Fxq 'OXIDIZED_LIBRENMS_TOKEN=7|abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN' .env
+check "keeps the other settings" grep -Fxq 'OTHER=keep' .env
+equals "the token is in .env once" 1 "$(grep -c '^OXIDIZED_LIBRENMS_TOKEN=' .env)"
+check "enables the integration" logged "$LNMS config:set oxidized.enabled true"
+check "sets the Oxidized URL" logged "$LNMS config:set oxidized.url http://oxidized:8888"
+check "tells you to restart Oxidized" grep -q './run restart oxidized' out.txt
+run_code oxidized-setup
+absent "a second run keeps the token" "api:token-create"
+check "and says how to replace it" grep -q -- '--force' out.txt
+FAKE_API_TOKEN='9|ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponm' run_code oxidized-setup --force admin2
+check "--force and a user name create a new token" logged "$LNMS api:token-create --name=oxidized admin2"
+check "and replace the old one" grep -Fxq 'OXIDIZED_LIBRENMS_TOKEN=9|ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponm' .env
+FAKE_FAIL_MATCH='api:token-create' run_code oxidized-setup --force ghost
+equals "a failing token command exits 1" 1 "$code"
+check "and suggests naming an existing user" grep -q 'oxidized-setup <username>' err.txt
+check "and leaves the old token alone" grep -Fxq 'OXIDIZED_LIBRENMS_TOKEN=9|ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponm' .env
+
 echo "update"
 printf 'MYSQL_PASSWORD=test\n' > .env
 run_code update

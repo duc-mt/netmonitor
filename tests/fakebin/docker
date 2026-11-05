@@ -8,6 +8,9 @@
 #   FAKE_FAIL_MATCH   any call containing this text fails with exit code 1
 #   FAKE_MEMTOTAL     what "docker info --format {{.MemTotal}}" prints, in bytes (default 8 GiB)
 #   FAKE_DB_ROWS      what a mariadb query through "compose exec -T db sh -c ..." prints (\n and \t are expanded)
+#   FAKE_DF           what the storage check of "doctor" reads: a df line, then the du size in KB (\n expanded)
+#   FAKE_API_TOKEN    the token "lnms api:token-create" prints (default: a Sanctum-style 7|... token)
+#   FAKE_USER_ADD_ERR makes "lnms user:add" print this message on stderr and fail
 #   FAKE_SERVICES     what "docker compose config --services" lists (default: db redis librenms dispatcher)
 echo "$*" >> "${FAKE_LOG:?FAKE_LOG must be set}"
 case "$*" in
@@ -17,8 +20,11 @@ case "$*" in
   "compose version") echo "Docker Compose version v2.fake" ;;
   "compose config --services") echo "${FAKE_SERVICES:-db redis librenms dispatcher}" | tr ' ' '\n' ;;
   "compose ps --status running --services") echo "${FAKE_RUNNING-db redis librenms dispatcher}" | tr ' ' '\n' ;;
+  *"df -Pk"*) printf '%b' "${FAKE_DF:-overlay 100000000 10000000 90000000 10% /data\\n1048576\\n}" ;;
   "compose exec -T db sh -c"*) printf '%b' "${FAKE_DB_ROWS:-}" ;;
   "compose images") echo "CONTAINER REPOSITORY TAG" ;;
+  *api:token-create*) printf 'API token created\n\n%s\n\nSave it now.\n' "${FAKE_API_TOKEN:-7|abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN}" ;;
+  *user:add*) if [ -n "${FAKE_USER_ADD_ERR:-}" ]; then echo "$FAKE_USER_ADD_ERR" >&2; exit 1; fi ;;
   *config:get*) printf '%s\n' "${FAKE_CONFIG_GET:-}" ;;
   "compose up -d --wait") exit "${FAKE_UP_EXIT:-0}" ;;
 esac

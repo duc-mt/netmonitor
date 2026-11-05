@@ -12,9 +12,16 @@
   .\scripts\run.ps1 backup [-Keep 7]         # back up the database and data to .\backups
   .\scripts\run.ps1 restore latest [-Yes]    # restore from .\backups: 'latest', a name or a file path
   .\scripts\run.ps1 validate                 # run LibreNMS' own self-check (validate.php)
-  .\scripts\run.ps1 configure [-DryRun]     # apply the settings in .env to LibreNMS (workers, mail, NetFlow); safe to repeat
+  .\scripts\run.ps1 configure [-DryRun]     # apply the settings in .env to LibreNMS (workers, retention, admin, mail, NetFlow); safe to repeat
   .\scripts\run.ps1 add-device <host> [opts] # add a device (e.g. .\scripts\run.ps1 add-device 192.168.1.1 -v 2c -c public)
   .\scripts\run.ps1 scan <subnet> [options]  # auto-discover devices on subnet (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)
+  .\scripts\run.ps1 lnms [args...]          # run LibreNMS CLI commands (e.g. .\scripts\run.ps1 lnms user:add <user> -r admin)
+  .\scripts\run.ps1 user-add <user> [-p <password>] [-r <role>] [-e <email>]   # create a user; without -p a password is generated
+  .\scripts\run.ps1 oxidized-setup [user] [--force]   # pair Oxidized with LibreNMS: API token into .env, integration on
+  .\scripts\run.ps1 poll-device <host>     # poll one device now with full debug output
+  .\scripts\run.ps1 snmp-walk <host> [oid]  # walk a device's SNMP tree from the LibreNMS container
+  .\scripts\run.ps1 ping-device <host>     # check a device with LibreNMS' own ping check
+  .\scripts\run.ps1 sync-inventory         # write the LibreNMS devices as the netops inventory.csv (needs bash)
   .\scripts\run.ps1 update [-NoBackup]      # back up, pull newer images, restart, self-check
   .\scripts\run.ps1 doctor [-Fix]           # check the setup (Docker, .env, profiles, memory); -Fix repairs permissions
 
@@ -34,6 +41,12 @@ $rawArgs = @($args)
 if ($rawArgs.Count -gt 0 -and $rawArgs[0] -notmatch '^-') {
     $Command = $rawArgs[0]
     $rawArgs = @($rawArgs | Select-Object -Skip 1)
+    # These commands hand every argument on untouched and in order: switches like -y, -Fix or -DryRun are
+    # meant for the tool behind them, not for this launcher.
+    if (@('lnms', 'user-add', 'oxidized-setup', 'poll-device', 'snmp-walk', 'ping-device', 'sync-inventory') -contains $Command) {
+        $ExtraArgs = @($rawArgs)
+        $rawArgs = @()
+    }
 }
 
 $i = 0
@@ -90,21 +103,32 @@ function Show-Usage {
         '  .\scripts\run.ps1 backup [-Keep 7]         back up the database and data to .\backups'
         '  .\scripts\run.ps1 restore latest [-Yes]    restore from .\backups: ''latest'', a name or a file path'
         '  .\scripts\run.ps1 validate                 run LibreNMS'' own self-check (validate.php)'
-        '  .\scripts\run.ps1 configure [-DryRun]     apply the settings in .env to LibreNMS (workers, mail, NetFlow); safe to repeat'
+        '  .\scripts\run.ps1 configure [-DryRun]     apply the settings in .env to LibreNMS (workers, retention, admin, mail, NetFlow); safe to repeat'
         '  .\scripts\run.ps1 add-device <host> [opts] add a device (e.g. .\scripts\run.ps1 add-device 192.168.1.1 -v 2c -c public)'
         '  .\scripts\run.ps1 scan <subnet> [options]  auto-discover subnet devices via SNMP (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)'
         '  .\scripts\run.ps1 update [-NoBackup]      back up, pull newer images, restart, self-check'
         '  .\scripts\run.ps1 doctor [-Fix]           check setup (Docker, .env, profiles, memory); -Fix repairs .env permissions'
         '  .\scripts\run.ps1 lnms [args...]          run LibreNMS CLI commands (e.g. .\scripts\run.ps1 lnms user:add <user> -r admin)'
+        '  .\scripts\run.ps1 user-add <user> [-p <password>] [-r <role>] [-e <email>]  create a user (default role admin); without -p a password is generated'
+        '  .\scripts\run.ps1 oxidized-setup [user] [--force]  pair Oxidized with LibreNMS: API token into .env, integration on'
+        '  .\scripts\run.ps1 poll-device <host>     poll one device now with full debug output'
+        '  .\scripts\run.ps1 snmp-walk <host> [oid]  walk a device''s SNMP tree from the LibreNMS container'
+        '  .\scripts\run.ps1 ping-device <host>     check a device with LibreNMS'' own ping check'
+        '  .\scripts\run.ps1 sync-inventory         write the LibreNMS devices as the netops inventory.csv (needs bash)'
     ) | ForEach-Object { Write-Host $_ }
 }
 
 # Run docker with a relaxed error preference (Windows PowerShell 5.1 treats stderr output as an error under 'Stop').
-# Returns the exit code; with -Capture also returns stdout lines.
-function Invoke-Docker([string[]]$DockerArgs, [switch]$Capture) {
+# Returns the exit code; with -Capture also returns stdout lines (-Merge: stdout and stderr).
+function Invoke-Docker([string[]]$DockerArgs, [switch]$Capture, [switch]$Merge) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
+        if ($Merge) {
+            # stdout and stderr together, as text: for commands whose error message the caller wants to show
+            $lines = @(& docker @DockerArgs 2>&1 | ForEach-Object { "$_" })
+            return [pscustomobject]@{ Code = $LASTEXITCODE; Output = $lines }
+        }
         if ($Capture) {
             $lines = @(& docker @DockerArgs 2>$null)
             return [pscustomobject]@{ Code = $LASTEXITCODE; Output = $lines }
@@ -143,13 +167,129 @@ function Test-Profile([string]$Name) {
 }
 
 # Run lnms inside the LibreNMS container (with -DryRun: only print what would run).
-function Invoke-Lnms([string[]]$LnmsArgs, [switch]$Capture) {
+function Invoke-Lnms([string[]]$LnmsArgs, [switch]$Capture, [switch]$Merge) {
     if ($DryRun) {
         Write-Host ('lnms ' + ($LnmsArgs -join ' '))
         return [pscustomobject]@{ Code = 0; Output = @() }
     }
     $dockerArgs = @('compose', 'exec', '-T', 'librenms', 'su', '-s', '/bin/sh', 'librenms', '-c', 'php /opt/librenms/lnms "$@"', '--', 'lnms') + $LnmsArgs
-    return Invoke-Docker $dockerArgs -Capture:$Capture
+    return Invoke-Docker $dockerArgs -Capture:$Capture -Merge:$Merge
+}
+
+# Run a command from /opt/librenms (validate.php, addhost.php, snmp-scan.py) as the librenms user, through the same
+# "su -s /bin/sh" as Invoke-Lnms: the exec option that picks the user fails on Docker Desktop, where the host GIDs
+# differ from the container's. $Tag only names the shell ($0); the arguments are passed on untouched.
+# No double quotes inside the commands that doctor sends: Windows PowerShell 5.1 drops them on the way to docker.exe,
+# so those scripts use "IFS=" instead of quoting to keep a value in one piece.
+function Invoke-LibrenmsExec([string]$Tag, [string]$Cmd, [string[]]$ExecArgs = @()) {
+    $dockerArgs = @('compose', 'exec', '-T', 'librenms', 'su', '-s', '/bin/sh', 'librenms', '-c', ('cd /opt/librenms && ' + $Cmd + ' "$@"'), '--', $Tag) + $ExecArgs
+    return Invoke-Docker $dockerArgs
+}
+
+function Get-FirstLine([object[]]$Lines) {
+    return (@($Lines | Where-Object { "$_".Trim() } | Select-Object -First 1) -join '')
+}
+
+function Test-UserExistsMessage([string]$Text) {
+    return ($Text -match '(?i)taken|already|exists|unique')
+}
+
+# A random password of 24 characters from A-Z a-z 0-9 and !#%*+=, with at least one of each kind.
+function New-Password {
+    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#%*+='
+    $limit = 256 - (256 % $chars.Length)   # bytes at or above this are skipped, so every character is equally likely
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        while ($true) {
+            $pw = ''
+            $buf = New-Object byte[] 64
+            while ($pw.Length -lt 24) {
+                $rng.GetBytes($buf)
+                foreach ($b in $buf) {
+                    if ($b -lt $limit -and $pw.Length -lt 24) { $pw += $chars[$b % $chars.Length] }
+                }
+            }
+            if (($pw -cmatch '[A-Z]') -and ($pw -cmatch '[a-z]') -and ($pw -cmatch '[0-9]') -and ($pw -cmatch '[!#%*+=]')) { return $pw }
+        }
+    }
+    finally { $rng.Dispose() }
+}
+
+# Set KEY=value in .env: replace the first KEY= line, or add one. Written as UTF-8 without a BOM, with LF line ends.
+function Set-EnvValue([string]$Key, [string]$Value) {
+    $path = Join-Path $Root '.env'
+    $lines = @(Get-Content -LiteralPath $path)
+    $done = $false
+    for ($n = 0; $n -lt $lines.Count; $n++) {
+        if (-not $done -and $lines[$n].StartsWith("$Key=")) { $lines[$n] = "$Key=$Value"; $done = $true }
+    }
+    if (-not $done) { $lines += "$Key=$Value" }
+    [System.IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Invoke-UserAdd([string[]]$UserArgs) {
+    $user = ''; $password = ''; $role = 'admin'; $email = ''
+    $n = 0
+    while ($n -lt $UserArgs.Count) {
+        $a = $UserArgs[$n]
+        if (@('-p', '--password', '-r', '--role', '-e', '--email') -contains $a) {
+            if ($n + 1 -ge $UserArgs.Count) { Write-Host "error: user-add: $a needs a value" -ForegroundColor Red; exit 2 }
+            $n++
+            if (@('-p', '--password') -contains $a) { $password = $UserArgs[$n] }
+            elseif (@('-r', '--role') -contains $a) { $role = $UserArgs[$n] }
+            else { $email = $UserArgs[$n] }
+        }
+        elseif ($a -match '^-') { Write-Host "error: user-add: unknown option: $a" -ForegroundColor Red; exit 2 }
+        elseif ($user) { Write-Host "error: user-add: only one username, got '$user' and '$a'" -ForegroundColor Red; exit 2 }
+        else { $user = $a }
+        $n++
+    }
+    if (-not $user) { Fail 'usage: .\scripts\run.ps1 user-add <username> [-p <password>] [-r admin|global-read|user] [-e <email>]' }
+    if (@('admin', 'global-read', 'user') -cnotcontains $role) { Fail "user-add: the role must be admin, global-read or user, not '$role'" }
+    $generated = $false
+    if (-not $password) { $password = New-Password; $generated = $true }
+    $lnmsArgs = @('user:add', $user, '-p', $password, '-r', $role)
+    if ($email) { $lnmsArgs += @('-e', $email) }
+    $result = Invoke-Lnms $lnmsArgs -Capture -Merge
+    if ($result.Code -ne 0) {
+        if (Test-UserExistsMessage ($result.Output -join "`n")) { Fail "user '$user' already exists (or the name is taken)" }
+        Fail "could not create user '$user': $(Get-FirstLine $result.Output)"
+    }
+    Write-Host "User '$user' created (role: $role)."
+    if ($generated) {
+        Write-Host "Generated secure password for ${user}: $password"
+        Write-Host 'Save it now: it is not stored anywhere.'
+    }
+}
+
+# Create an API token for Oxidized, keep it in .env and switch the LibreNMS side on.
+function Invoke-OxidizedSetup([string[]]$SetupArgs) {
+    $user = ''; $force = $false
+    foreach ($a in $SetupArgs) {
+        if ($a -eq '--force' -or $a -eq '-Force') { $force = $true }
+        elseif ($a -match '^-') { Write-Host "error: oxidized-setup: unknown option: $a" -ForegroundColor Red; exit 2 }
+        else { $user = $a }
+    }
+    if (-not (Test-Profile 'oxidized')) { Fail "profile 'oxidized' is not enabled. Add it to COMPOSE_PROFILES in .env first, then run .\scripts\run.ps1 up and .\scripts\run.ps1 oxidized-setup" }
+    if (-not $user) { $user = Get-Setting 'LIBRENMS_ADMIN_USER' 'librenms' }
+    if ((Get-Setting 'OXIDIZED_LIBRENMS_TOKEN') -and -not $force) {
+        Write-Host 'OXIDIZED_LIBRENMS_TOKEN is already set in .env (--force creates a new token).'
+    }
+    else {
+        Write-Host "Creating the API token 'oxidized' for LibreNMS user '$user'"
+        $result = Invoke-Lnms @('api:token-create', '--name=oxidized', $user) -Capture -Merge
+        if ($result.Code -ne 0) {
+            Fail "could not create the API token for '$user': $(Get-FirstLine $result.Output) (name an existing LibreNMS user: .\scripts\run.ps1 oxidized-setup <username>)"
+        }
+        $found = @([regex]::Matches(($result.Output -join "`n"), '\d+\|[A-Za-z0-9]{32,}') | ForEach-Object { $_.Value })
+        if ($found.Count -eq 0) { $found = @($result.Output | Where-Object { $_ -match '^[A-Za-z0-9]{32,}$' }) }
+        if ($found.Count -eq 0) { Fail 'no token found in the output of api:token-create' }
+        Set-EnvValue 'OXIDIZED_LIBRENMS_TOKEN' $found[-1]
+        Write-Host '  Saved OXIDIZED_LIBRENMS_TOKEN in .env'
+    }
+    Set-Lnms @('config:set', 'oxidized.enabled', 'true')
+    Set-Lnms @('config:set', 'oxidized.url', 'http://oxidized:8888')
+    Write-Host 'Done. Restart Oxidized so that it reads the token: .\scripts\run.ps1 restart oxidized'
 }
 
 function Set-Lnms([string[]]$LnmsArgs) {
@@ -192,6 +332,38 @@ function Invoke-Configure {
     if ($workers -notmatch '^\d+$') { Fail "DISPATCHER_WORKERS must be a number, not '$workers'" }
     Write-Host "Poller workers: $workers"
     Set-Lnms @('config:set', 'service_poller_workers', $workers)
+
+    $syslogDays = Get-Setting 'SYSLOG_PURGE_DAYS' '30'
+    $eventlogDays = Get-Setting 'EVENTLOG_PURGE_DAYS' '90'
+    if ($syslogDays -notmatch '^\d+$') { Fail "SYSLOG_PURGE_DAYS must be a number of days, not '$syslogDays'" }
+    if ($eventlogDays -notmatch '^\d+$') { Fail "EVENTLOG_PURGE_DAYS must be a number of days, not '$eventlogDays'" }
+    Write-Host "Data retention: syslog $syslogDays days, event log $eventlogDays days"
+    Set-Lnms @('config:set', 'syslog_purge', $syslogDays)
+    Set-Lnms @('config:set', 'eventlog_purge', $eventlogDays)
+
+    $adminUser = Get-Setting 'LIBRENMS_ADMIN_USER'
+    $adminPw = Get-Setting 'LIBRENMS_ADMIN_PASSWORD'
+    if ($adminUser -and $adminPw) {
+        Write-Host 'Initial admin account:'
+        if ($DryRun) {
+            Write-Host "lnms user:add $adminUser -p ******** -r admin"
+        }
+        else {
+            $added = Invoke-Lnms @('user:add', $adminUser, '-p', $adminPw, '-r', 'admin') -Capture -Merge
+            if ($added.Code -eq 0 -or (Test-UserExistsMessage ($added.Output -join "`n"))) {
+                Write-Host "  Admin account '$adminUser' is ready."
+            }
+            else {
+                Write-Warning "could not create the admin account '$adminUser': $(Get-FirstLine $added.Output)"
+            }
+        }
+    }
+    elseif ($adminUser -or $adminPw) {
+        Write-Warning 'LIBRENMS_ADMIN_USER and LIBRENMS_ADMIN_PASSWORD must both be set, admin account skipped.'
+    }
+    else {
+        Write-Host 'Initial admin account: LIBRENMS_ADMIN_USER is not set, skipped.'
+    }
 
     if (Test-Profile 'mail') {
         Write-Host 'Mail relay (profile mail):'
@@ -267,7 +439,7 @@ function Invoke-Update {
         exit 1
     }
     Write-Host '==> LibreNMS self-check'
-    $check = Invoke-Docker @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'php', 'validate.php')
+    $check = Invoke-LibrenmsExec 'validate' 'php validate.php'
     if ($check.Code -ne 0) {
         Write-Host 'warning: validate.php reported problems (see above). Nothing was rolled back.' -ForegroundColor Yellow
     }
@@ -434,6 +606,22 @@ function Invoke-Doctor {
     if ((Test-Profile 'syslog') -or (Test-Profile 'traps') -or (Test-Profile 'netflow')) {
         Write-Check 'info' 'syslog, trap and flow ports are open to every sender: restrict them (see README, Firewall)'
     }
+    if (Test-Profile 'proxy') {
+        foreach ($who in @('OXIDIZED', 'SMOKEPING')) {
+            $authUser = Get-Setting "${who}_AUTH_USER"
+            $authHash = Get-Setting "${who}_AUTH_HASH"
+            if (-not $authUser) { continue }
+            if (-not $authHash) {
+                Write-Check 'warn' "${who}_AUTH_USER is set but ${who}_AUTH_HASH is empty: nobody can log in to the $who name (README, Oxidized)"
+            }
+            elseif ($authHash -match '^\$2[aby]\$..\$') {
+                Write-Check 'ok' "${who}: HTTP Basic Auth is on for user $authUser"
+            }
+            else {
+                Write-Check 'warn' "${who}_AUTH_HASH does not look like a bcrypt hash (`$2a`$...): make it with caddy hash-password and put it in single quotes in .env"
+            }
+        }
+    }
     $latest = @()
     if ((Get-Setting 'LIBRENMS_VERSION' 'latest') -eq 'latest') { $latest += 'librenms' }
     if ((Test-Profile 'mail') -and ((Get-Setting 'MSMTPD_VERSION' 'latest') -eq 'latest')) { $latest += 'msmtpd' }
@@ -465,6 +653,7 @@ function Invoke-Doctor {
         }
 
         Write-Host 'Stack'
+        $running = @()
         $cfg = Invoke-Docker @('compose', 'config', '--services') -Capture
         if ($cfg.Code -eq 0) {
             Write-Check 'ok' 'docker compose accepts the configuration'
@@ -477,6 +666,63 @@ function Invoke-Doctor {
         else {
             Write-Check 'err' 'docker compose rejects the configuration (run: docker compose config)'
         }
+
+        if ($running.Count -gt 0) {
+            Write-Host 'Storage'
+            $warnPct = Get-Setting 'DOCTOR_DISK_WARN_PCT' '80'
+            $warnGb = Get-Setting 'DOCTOR_VOLUME_WARN_GB' '50'
+            if ($warnPct -notmatch '^\d+$') { Write-Check 'warn' "DOCTOR_DISK_WARN_PCT '$warnPct' is not a number, using 80"; $warnPct = '80' }
+            if ($warnGb -notmatch '^\d+$') { Write-Check 'warn' "DOCTOR_VOLUME_WARN_GB '$warnGb' is not a number, using 50"; $warnGb = '50' }
+            $volumes = @(
+                @{ Name = 'data'; Service = 'librenms'; Path = '/data' },
+                @{ Name = 'db'; Service = 'db'; Path = '/var/lib/mysql' }
+            )
+            if (Test-Profile 'netflow') { $volumes += @{ Name = 'nfsen'; Service = 'librenms'; Path = '/netflow' } }
+            foreach ($v in $volumes) {
+                if ($running -notcontains $v.Service) { Write-Check 'info' "volume $($v.Name): not measured ($($v.Service) is not running)"; continue }
+                $probe = 'df -Pk $1 | tail -n 1; du -sk $1 2>/dev/null | cut -f1'
+                $out = @((Invoke-Docker @('compose', 'exec', '-T', $v.Service, 'sh', '-c', $probe, 'sh', $v.Path) -Capture).Output)
+                $dfFields = @("$($out | Select-Object -First 1)".Trim() -split '\s+')
+                $pct = ''
+                if ($dfFields.Count -ge 5) { $pct = $dfFields[4] -replace '%', '' }
+                if ($pct -notmatch '^\d+$') { Write-Check 'info' "volume $($v.Name): could not read its disk usage"; continue }
+                $kb = [long]0
+                if ($out.Count -ge 2 -and "$($out[1])".Trim() -match '^\d+$') { $kb = [long]"$($out[1])".Trim() }
+                $gb = [math]::Floor($kb / 1048576)
+                if ($gb -ge 1) { $size = "$gb GB" } else { $size = "$([math]::Floor($kb / 1024)) MB" }
+                if ([int]$pct -gt [int]$warnPct) {
+                    Write-Check 'warn' "volume $($v.Name): the disk holding it is $pct% full (limit $warnPct%): free space, lower the retention days or move Docker's data folder"
+                }
+                elseif ($kb -gt ([long]$warnGb * 1048576)) {
+                    Write-Check 'warn' "volume $($v.Name): $size is more than the $warnGb GB limit (README, Tuning: retention, RRD and flow data)"
+                }
+                else { Write-Check 'ok' "volume $($v.Name): $size, disk $pct% full" }
+            }
+
+            Write-Host 'Poller'
+            if ($running -contains 'dispatcher') {
+                $sql = 'SELECT COALESCE(SUM(last_polled IS NULL OR last_polled < NOW() - INTERVAL 15 MINUTE), 0), COALESCE(SUM(last_polled_timetaken > 300), 0) FROM devices WHERE disabled = 0 AND status = 1'
+                $mysqlCmd = 'IFS=; set -f; mariadb -N -B -u$MARIADB_USER -p$MARIADB_PASSWORD $MARIADB_DATABASE -e $1'
+                $rows = "$((Invoke-Docker @('compose', 'exec', '-T', 'db', 'sh', '-c', $mysqlCmd, 'sh', $sql) -Capture).Output | Select-Object -First 1)".Trim()
+                $parts = @($rows -split '\s+')
+                if ($parts.Count -lt 2 -or $parts[0] -notmatch '^\d+$' -or $parts[1] -notmatch '^\d+$') {
+                    Write-Check 'info' 'poller: could not read the device poll times from the database'
+                }
+                else {
+                    $late = [int]$parts[0]; $slow = [int]$parts[1]
+                    if ($late -eq 0 -and $slow -eq 0) { Write-Check 'ok' 'poller: every up device was polled within the last 15 minutes' }
+                    if ($late -gt 0) {
+                        Write-Check 'warn' "poller: $late device(s) not polled for over 15 minutes (backlog): raise DISPATCHER_WORKERS (now $(Get-Setting 'DISPATCHER_WORKERS' '8')) or MARIADB_BUFFER_POOL_SIZE (now $(Get-Setting 'MARIADB_BUFFER_POOL_SIZE' '512M')); see .\scripts\run.ps1 logs dispatcher"
+                    }
+                    if ($slow -gt 0) {
+                        Write-Check 'warn' "poller: $slow device(s) took longer than 300 s to poll, more than the 5-minute cycle: raise DISPATCHER_WORKERS or MARIADB_BUFFER_POOL_SIZE, or look at the slowest devices"
+                    }
+                }
+            }
+            else {
+                Write-Check 'warn' 'poller: the dispatcher is not running, so no device is polled (start it with .\scripts\run.ps1 up)'
+            }
+        }
     }
 
     Write-Host ''
@@ -485,7 +731,7 @@ function Invoke-Doctor {
 }
 
 if (@('help', '--help', '-h', '/?') -contains $Command) { Show-Usage; exit 0 }
-if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan', 'lnms') -notcontains $Command) {
+if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan', 'lnms', 'user-add', 'oxidized-setup', 'poll-device', 'snmp-walk', 'ping-device', 'sync-inventory') -notcontains $Command) {
     Write-Host "error: unknown command: $Command" -ForegroundColor Red
     Show-Usage
     exit 2
@@ -531,17 +777,16 @@ try {
         'update'    { Invoke-Update }
         'doctor'    { Invoke-Doctor }
         'validate' {
-            $code = (Invoke-Docker @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'php', 'validate.php')).Code
+            $code = (Invoke-LibrenmsExec 'validate' 'php validate.php' $ExtraArgs).Code
         }
         'add-device' {
             if (-not $Name) { Fail 'usage: .\scripts\run.ps1 add-device <hostname-or-ip> [options]' }
-            $argsList = @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'php', 'addhost.php', $Name)
+            $argsList = @($Name)
             if ($ExtraArgs) { $argsList += $ExtraArgs }
-            $code = (Invoke-Docker $argsList).Code
+            $code = (Invoke-LibrenmsExec 'add-device' 'php addhost.php' $argsList).Code
         }
         'lnms' {
             $cmdArgs = @()
-            if ($Name) { $cmdArgs += $Name }
             if ($ExtraArgs) { $cmdArgs += $ExtraArgs }
             if ($cmdArgs.Count -eq 0) { Fail 'usage: .\scripts\run.ps1 lnms <command> [options] (e.g. .\scripts\run.ps1 lnms user:add <user> -r admin)' }
             $dockerArgs = @('compose', 'exec', '-T', 'librenms', 'su', '-s', '/bin/sh', 'librenms', '-c', 'php /opt/librenms/lnms "$@"', '--', 'lnms') + $cmdArgs
@@ -549,9 +794,28 @@ try {
         }
         'scan' {
             if (-not $Name) { Fail 'usage: .\scripts\run.ps1 scan <subnet> [options] (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)' }
-            $argsList = @('compose', 'exec', '-T', '--user', 'librenms', '-w', '/opt/librenms', 'librenms', 'python3', 'snmp-scan.py', $Name)
+            $argsList = @($Name)
             if ($ExtraArgs) { $argsList += $ExtraArgs }
-            $code = (Invoke-Docker $argsList).Code
+            $code = (Invoke-LibrenmsExec 'scan' 'python3 snmp-scan.py' $argsList).Code
+        }
+        'user-add'       { Invoke-UserAdd $ExtraArgs }
+        'oxidized-setup' { Invoke-OxidizedSetup $ExtraArgs }
+        'poll-device' {
+            if ($ExtraArgs.Count -lt 1) { Fail 'usage: .\scripts\run.ps1 poll-device <hostname-ip-or-device-id>' }
+            $code = (Invoke-Lnms (@('device:poll') + $ExtraArgs + @('-vvv'))).Code
+        }
+        'snmp-walk' {
+            if ($ExtraArgs.Count -lt 1) { Fail 'usage: .\scripts\run.ps1 snmp-walk <host> [oid]' }
+            $code = (Invoke-Lnms (@('snmp:walk') + $ExtraArgs)).Code
+        }
+        'ping-device' {
+            if ($ExtraArgs.Count -lt 1) { Fail 'usage: .\scripts\run.ps1 ping-device <hostname-or-ip>' }
+            $code = (Invoke-Lnms (@('device:ping') + $ExtraArgs)).Code
+        }
+        'sync-inventory' {
+            if (-not (Get-Command bash -ErrorAction SilentlyContinue)) { Fail 'sync-inventory runs scripts/netops-sync.sh and needs bash (Git for Windows or WSL) in the PATH' }
+            & bash 'scripts/netops-sync.sh' @ExtraArgs
+            $code = $LASTEXITCODE
         }
     }
     exit $code

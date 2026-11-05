@@ -9,12 +9,18 @@
 #   ./run backup [--keep N]   back up the database and data to ./backups
 #   ./run restore <target>    restore from ./backups: 'latest', a name or a file path (--yes skips the question)
 #   ./run validate            run LibreNMS' own self-check (validate.php)
-#   ./run configure           apply settings in .env (workers, mail, NetFlow, Telegram, rules); safe to repeat (--dry-run: only show)
+#   ./run configure           apply settings in .env (workers, retention, admin, mail, NetFlow, Telegram); safe to repeat (--dry-run: only show)
 #   ./run add-device <host>   add a device (options: -v [2c|3], -c <community>, -u <user>, -a <pass>, -x <priv>)
 #   ./run scan <subnet>       auto-discover devices on a subnet using snmp-scan.py (e.g. 192.168.1.0/24)
 #   ./run update              back up, pull newer images, restart, self-check (--no-backup skips the backup)
 #   ./run doctor [--fix]      check setup (Docker, .env, profiles, memory); --fix auto-repairs .env permissions
 #   ./run lnms [args...]      run LibreNMS CLI commands (e.g. ./run lnms user:add <user> -r admin)
+#   ./run user-add <user>     create a user (options: -p <password>, -r <role> default admin, -e <email>); no -p generates a password
+#   ./run oxidized-setup      pair Oxidized with LibreNMS: create an API token, save it in .env, enable the integration ([user], --force)
+#   ./run poll-device <host>  poll one device now with full debug output (host name, IP or device id)
+#   ./run snmp-walk <host> [oid]  walk a device's SNMP tree from the LibreNMS container
+#   ./run ping-device <host>  check a device with LibreNMS' own ping check
+#   ./run sync-inventory      write the LibreNMS devices as the netops inventory.csv (options of scripts/netops-sync.sh)
 #
 set -euo pipefail
 
@@ -22,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$ROOT_DIR"
 
-usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die() { echo "error: $*" >&2; exit 1; }
 
 cmd=${1:-help}
@@ -30,7 +36,7 @@ cmd=${1:-help}
 
 case "$cmd" in
   help|-h|--help) usage; exit 0 ;;
-  up|down|restart|logs|status|backup|restore|validate|configure|update|doctor|add-device|scan|lnms) ;;
+  up|down|restart|logs|status|backup|restore|validate|configure|update|doctor|add-device|scan|lnms|user-add|oxidized-setup|poll-device|snmp-walk|ping-device|sync-inventory) ;;
   *) echo "error: unknown command: $cmd" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -117,6 +123,15 @@ lnms_run() {
   fi
 }
 
+# Run a command from /opt/librenms (validate.php, addhost.php, snmp-scan.py) as the librenms user, through the same
+# "su -s /bin/sh" as lnms_run: the exec option that picks the user fails on Docker Desktop (macOS), where the host
+# GIDs differ from the container's. The first argument only names the shell ($0); the rest are passed on untouched.
+librenms_run() {
+  local tag=$1 cmd=$2
+  shift 2
+  docker compose exec -T librenms su -s /bin/sh librenms -c "cd /opt/librenms && $cmd \"\$@\"" -- "$tag" "$@"
+}
+
 # Add a value to a list setting unless the list already has it. Entries are compared whole, so
 # ".../profiles-stat/live/" does not hide ".../profiles-stat". Repeating the command adds nothing.
 list_add() {
@@ -137,8 +152,116 @@ list_add() {
   fi
 }
 
+# A random password of 24 characters from A-Z a-z 0-9 and !#%*+=, with at least one of each kind.
+# "|| true": head closes the pipe early and tr then ends with SIGPIPE, which pipefail would turn into a failure.
+gen_password() {
+  local pw=""
+  while :; do
+    pw=$( (LC_ALL=C tr -dc 'A-Za-z0-9!#%*+=' </dev/urandom | head -c 24) 2>/dev/null || true)
+    [ "${#pw}" -eq 24 ] || continue
+    case $pw in *[A-Z]*) ;; *) continue ;; esac
+    case $pw in *[a-z]*) ;; *) continue ;; esac
+    case $pw in *[0-9]*) ;; *) continue ;; esac
+    case $pw in *[\!\#%*+=]*) ;; *) continue ;; esac
+    break
+  done
+  printf '%s' "$pw"
+}
+
+# Set KEY=value in .env: replace the first KEY= line, or append one. The file is rewritten in place, so its
+# permissions stay as they are. The value goes through the environment so awk never interprets it.
+set_env() {
+  local key=$1 value=$2 tmp
+  tmp=$(mktemp .env.XXXXXX)
+  NM_KEY=$key NM_VALUE=$value awk '
+    BEGIN { k = ENVIRON["NM_KEY"]; v = ENVIRON["NM_VALUE"]; done = 0 }
+    !done && index($0, k "=") == 1 { print k "=" v; done = 1; next }
+    { print }
+    END { if (!done) print k "=" v }' .env > "$tmp"
+  cat "$tmp" > .env
+  rm -f "$tmp"
+}
+
+# The first non-empty line of some command output, for a one-line error message.
+first_line() { printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | head -n 1 || true; }
+
+# Did lnms user:add refuse because the user is already there?
+user_exists_msg() { printf '%s\n' "$1" | grep -qiE 'taken|already|exists|unique'; }
+
+user_add() {
+  local user="" password="" role=admin email="" generated=0 out rc=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -p|--password) [ $# -ge 2 ] || { echo "error: user-add: $1 needs a value" >&2; exit 2; }; password=$2; shift ;;
+      -r|--role) [ $# -ge 2 ] || { echo "error: user-add: $1 needs a value" >&2; exit 2; }; role=$2; shift ;;
+      -e|--email) [ $# -ge 2 ] || { echo "error: user-add: $1 needs a value" >&2; exit 2; }; email=$2; shift ;;
+      -*) echo "error: user-add: unknown option: $1" >&2; exit 2 ;;
+      *) [ -z "$user" ] || { echo "error: user-add: only one username, got '$user' and '$1'" >&2; exit 2; }; user=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$user" ] || die "usage: ./run user-add <username> [-p <password>] [-r admin|global-read|user] [-e <email>]"
+  case $role in
+    admin|global-read|user) ;;
+    *) die "user-add: the role must be admin, global-read or user, not '$role'" ;;
+  esac
+  if [ -z "$password" ]; then
+    password=$(gen_password)
+    generated=1
+  fi
+  if [ -n "$email" ]; then
+    out=$(lnms_run user:add "$user" -p "$password" -r "$role" -e "$email" 2>&1) || rc=$?
+  else
+    out=$(lnms_run user:add "$user" -p "$password" -r "$role" 2>&1) || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    if user_exists_msg "$out"; then
+      die "user '$user' already exists (or the name is taken)"
+    fi
+    die "could not create user '$user': $(first_line "$out")"
+  fi
+  echo "User '$user' created (role: $role)."
+  if [ "$generated" -eq 1 ]; then
+    echo "Generated secure password for $user: $password"
+    echo "Save it now: it is not stored anywhere."
+  fi
+}
+
+# Create an API token for Oxidized, keep it in .env and switch the LibreNMS side on.
+oxidized_setup() {
+  local user="" force=0 out rc=0 token arg
+  for arg in "$@"; do
+    case $arg in
+      --force) force=1 ;;
+      -*) echo "error: oxidized-setup: unknown option: $arg" >&2; exit 2 ;;
+      *) user=$arg ;;
+    esac
+  done
+  has_profile oxidized || die "profile 'oxidized' is not enabled. Add it to COMPOSE_PROFILES in .env first, then run ./run up and ./run oxidized-setup"
+  [ -n "$user" ] || user=$(env_get LIBRENMS_ADMIN_USER librenms)
+  if [ -n "$(env_get OXIDIZED_LIBRENMS_TOKEN)" ] && [ "$force" -eq 0 ]; then
+    echo "OXIDIZED_LIBRENMS_TOKEN is already set in .env (--force creates a new token)."
+  else
+    echo "Creating the API token 'oxidized' for LibreNMS user '$user'"
+    out=$(lnms_run api:token-create --name=oxidized "$user" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      die "could not create the API token for '$user': $(first_line "$out") (name an existing LibreNMS user: ./run oxidized-setup <username>)"
+    fi
+    token=$(printf '%s\n' "$out" | grep -Eo '[0-9]+\|[A-Za-z0-9]{32,}' | tail -n 1 || true)
+    if [ -z "$token" ]; then
+      token=$(printf '%s\n' "$out" | grep -E '^[A-Za-z0-9]{32,}$' | tail -n 1 || true)
+    fi
+    [ -n "$token" ] || die "no token found in the output of api:token-create"
+    set_env OXIDIZED_LIBRENMS_TOKEN "$token"
+    echo "  Saved OXIDIZED_LIBRENMS_TOKEN in .env"
+  fi
+  lnms_run config:set oxidized.enabled true
+  lnms_run config:set oxidized.url http://oxidized:8888
+  echo "Done. Restart Oxidized so that it reads the token: ./run restart oxidized"
+}
+
 configure() {
-  local workers from running
+  local workers from running syslog_days eventlog_days admin_user admin_pw out rc
   if [ "$dry" -eq 0 ]; then
     running=$(docker compose ps --status running --services)
     case $'\n'"$running"$'\n' in
@@ -151,6 +274,35 @@ configure() {
   case $workers in ''|*[!0-9]*) die "DISPATCHER_WORKERS must be a number, not '$workers'" ;; esac
   echo "Poller workers: $workers"
   lnms_run config:set service_poller_workers "$workers"
+
+  syslog_days=$(env_get SYSLOG_PURGE_DAYS 30)
+  eventlog_days=$(env_get EVENTLOG_PURGE_DAYS 90)
+  case $syslog_days in ''|*[!0-9]*) die "SYSLOG_PURGE_DAYS must be a number of days, not '$syslog_days'" ;; esac
+  case $eventlog_days in ''|*[!0-9]*) die "EVENTLOG_PURGE_DAYS must be a number of days, not '$eventlog_days'" ;; esac
+  echo "Data retention: syslog $syslog_days days, event log $eventlog_days days"
+  lnms_run config:set syslog_purge "$syslog_days"
+  lnms_run config:set eventlog_purge "$eventlog_days"
+
+  admin_user=$(env_get LIBRENMS_ADMIN_USER)
+  admin_pw=$(env_get LIBRENMS_ADMIN_PASSWORD)
+  if [ -n "$admin_user" ] && [ -n "$admin_pw" ]; then
+    echo "Initial admin account:"
+    if [ "$dry" -eq 1 ]; then
+      echo "lnms user:add $admin_user -p ******** -r admin"
+    else
+      rc=0
+      out=$(lnms_run user:add "$admin_user" -p "$admin_pw" -r admin 2>&1) || rc=$?
+      if [ "$rc" -eq 0 ] || user_exists_msg "$out"; then
+        echo "  Admin account '$admin_user' is ready."
+      else
+        echo "  warning: could not create the admin account '$admin_user': $(first_line "$out")" >&2
+      fi
+    fi
+  elif [ -n "$admin_user" ] || [ -n "$admin_pw" ]; then
+    echo "warning: LIBRENMS_ADMIN_USER and LIBRENMS_ADMIN_PASSWORD must both be set, admin account skipped." >&2
+  else
+    echo "Initial admin account: LIBRENMS_ADMIN_USER is not set, skipped."
+  fi
 
   if has_profile mail; then
     echo "Mail relay (profile mail):"
@@ -218,7 +370,7 @@ update() {
     exit 1
   fi
   echo "==> LibreNMS self-check"
-  if ! docker compose exec -T --user librenms -w /opt/librenms librenms php validate.php; then
+  if ! librenms_run validate 'php validate.php'; then
     echo "warning: validate.php reported problems (see above). Nothing was rolled back." >&2
   fi
   echo "==> Done. Previous images are listed in $note"
@@ -230,6 +382,7 @@ doctor() {
   local errors=0 warnings=0 have_docker=0 mem mem_mb pool pool_mb pool_n pool_unit cfg running missing svc
   local profiles known p var latest first last range_ok sources seen_names seen_ports count bad src commas
   local name rest port type iface
+  running=""
   d_ok() { printf '  ok    %s\n' "$*"; }
   d_info() { printf '  info  %s\n' "$*"; }
   d_warn() { printf '  WARN  %s\n' "$*"; warnings=$((warnings + 1)); }
@@ -373,6 +526,23 @@ doctor() {
   if has_profile syslog || has_profile traps || has_profile netflow; then
     d_info "syslog, trap and flow ports are open to every sender: restrict them (see README, Firewall)"
   fi
+  if has_profile proxy; then
+    local who auth_user auth_hash
+    for who in OXIDIZED SMOKEPING; do
+      auth_user=$(env_get "${who}_AUTH_USER")
+      auth_hash=$(env_get "${who}_AUTH_HASH")
+      if [ -z "$auth_user" ]; then
+        continue
+      elif [ -z "$auth_hash" ]; then
+        d_warn "${who}_AUTH_USER is set but ${who}_AUTH_HASH is empty: nobody can log in to the ${who} name (README, Oxidized)"
+      else
+        case $auth_hash in
+          '$2'[aby]'$'??'$'*) d_ok "${who}: HTTP Basic Auth is on for user $auth_user" ;;
+          *) d_warn "${who}_AUTH_HASH does not look like a bcrypt hash (\$2a\$...): make it with caddy hash-password and put it in single quotes in .env" ;;
+        esac
+      fi
+    done
+  fi
   latest=""
   [ "$(env_get LIBRENMS_VERSION latest)" != latest ] || latest="$latest librenms"
   if has_profile mail && [ "$(env_get MSMTPD_VERSION latest)" = latest ]; then latest="$latest msmtpd"; fi
@@ -433,6 +603,63 @@ doctor() {
     else
       d_err "docker compose rejects the configuration: $(printf '%s\n' "$cfg" | head -n 1)"
     fi
+
+    if [ -n "$running" ]; then
+      echo "Storage"
+      local warn_pct warn_gb sql rows late slow
+      warn_pct=$(env_get DOCTOR_DISK_WARN_PCT 80)
+      warn_gb=$(env_get DOCTOR_VOLUME_WARN_GB 50)
+      case $warn_pct in ''|*[!0-9]*) d_warn "DOCTOR_DISK_WARN_PCT '$warn_pct' is not a number, using 80"; warn_pct=80 ;; esac
+      case $warn_gb in ''|*[!0-9]*) d_warn "DOCTOR_VOLUME_WARN_GB '$warn_gb' is not a number, using 50"; warn_gb=50 ;; esac
+      # storage_check <volume> <service that mounts it> <path inside that service>
+      storage_check() {
+        local vol=$1 svc=$2 path=$3 out pct kb gb size
+        case $'\n'"$running"$'\n' in
+          *$'\n'"$svc"$'\n'*) ;;
+          *) d_info "volume $vol: not measured ($svc is not running)"; return 0 ;;
+        esac
+        out=$(docker compose exec -T "$svc" sh -c 'df -Pk "$1" | tail -n 1; du -sk "$1" 2>/dev/null | cut -f1' sh "$path" 2>/dev/null || true)
+        pct=$(printf '%s\n' "$out" | sed -n '1p' | awk '{print $5}' | tr -d '%')
+        kb=$(printf '%s\n' "$out" | sed -n '2p' | tr -d ' ')
+        case $pct in ''|*[!0-9]*) d_info "volume $vol: could not read its disk usage"; return 0 ;; esac
+        case $kb in ''|*[!0-9]*) kb=0 ;; esac
+        gb=$((kb / 1048576))
+        if [ "$gb" -ge 1 ]; then size="$gb GB"; else size="$((kb / 1024)) MB"; fi
+        if [ "$pct" -gt "$warn_pct" ]; then
+          d_warn "volume $vol: the disk holding it is $pct% full (limit $warn_pct%): free space, lower the retention days or move Docker's data folder"
+        elif [ "$kb" -gt $((warn_gb * 1048576)) ]; then
+          d_warn "volume $vol: $size is more than the $warn_gb GB limit (README, Tuning: retention, RRD and flow data)"
+        else
+          d_ok "volume $vol: $size, disk $pct% full"
+        fi
+      }
+      storage_check data librenms /data
+      storage_check db db /var/lib/mysql
+      if has_profile netflow; then storage_check nfsen librenms /netflow; fi
+
+      echo "Poller"
+      case $'\n'"$running"$'\n' in
+        *$'\n'dispatcher$'\n'*)
+          sql="SELECT COALESCE(SUM(last_polled IS NULL OR last_polled < NOW() - INTERVAL 15 MINUTE), 0), COALESCE(SUM(last_polled_timetaken > 300), 0) FROM devices WHERE disabled = 0 AND status = 1"
+          rows=$(docker compose exec -T db sh -c 'mariadb -N -B -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE" -e "$1"' sh "$sql" 2>/dev/null || true)
+          late="" slow=""
+          read -r late slow <<<"$rows" || true
+          case $late$slow in
+            ''|*[!0-9]*) d_info "poller: could not read the device poll times from the database" ;;
+            *)
+              if [ "$late" -eq 0 ] && [ "$slow" -eq 0 ]; then
+                d_ok "poller: every up device was polled within the last 15 minutes"
+              fi
+              if [ "$late" -gt 0 ]; then
+                d_warn "poller: $late device(s) not polled for over 15 minutes (backlog): raise DISPATCHER_WORKERS (now $(env_get DISPATCHER_WORKERS 8)) or MARIADB_BUFFER_POOL_SIZE (now $(env_get MARIADB_BUFFER_POOL_SIZE 512M)); see ./run logs dispatcher"
+              fi
+              if [ "$slow" -gt 0 ]; then
+                d_warn "poller: $slow device(s) took longer than 300 s to poll, more than the 5-minute cycle: raise DISPATCHER_WORKERS or MARIADB_BUFFER_POOL_SIZE, or look at the slowest devices"
+              fi ;;
+          esac ;;
+        *) d_warn "poller: the dispatcher is not running, so no device is polled (start it with ./run up)" ;;
+      esac
+    fi
   fi
 
   echo
@@ -450,17 +677,29 @@ case "$cmd" in
   status) docker compose ps "$@" ;;
   backup) exec bash scripts/backup.sh "$@" ;;
   restore) exec bash scripts/restore.sh "$@" ;;
-  validate) docker compose exec -T --user librenms -w /opt/librenms librenms php validate.php ;;
+  validate) librenms_run validate 'php validate.php' "$@" ;;
   add-device)
     [ $# -ge 1 ] || die "usage: ./run add-device <hostname-or-ip> [options]"
-    docker compose exec -T --user librenms -w /opt/librenms librenms php addhost.php "$@" ;;
+    librenms_run add-device 'php addhost.php' "$@" ;;
   scan)
     [ $# -ge 1 ] || die "usage: ./run scan <subnet> [options] (e.g. ./run scan 192.168.1.0/24)"
-    docker compose exec -T --user librenms -w /opt/librenms librenms python3 snmp-scan.py "$@" ;;
+    librenms_run scan 'python3 snmp-scan.py' "$@" ;;
   configure) configure ;;
   update) update ;;
   doctor) doctor ;;
   lnms)
     [ $# -ge 1 ] || die "usage: ./run lnms <command> [options] (e.g. ./run lnms user:add <user> -r admin)"
     docker compose exec -T librenms su -s /bin/sh librenms -c 'php /opt/librenms/lnms "$@"' -- lnms "$@" ;;
+  user-add) user_add "$@" ;;
+  oxidized-setup) oxidized_setup "$@" ;;
+  poll-device)
+    [ $# -ge 1 ] || die "usage: ./run poll-device <hostname-ip-or-device-id>"
+    lnms_run device:poll "$@" -vvv ;;
+  snmp-walk)
+    [ $# -ge 1 ] || die "usage: ./run snmp-walk <host> [oid]"
+    lnms_run snmp:walk "$@" ;;
+  ping-device)
+    [ $# -ge 1 ] || die "usage: ./run ping-device <hostname-or-ip>"
+    lnms_run device:ping "$@" ;;
+  sync-inventory) exec bash scripts/netops-sync.sh "$@" ;;
 esac

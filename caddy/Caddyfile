@@ -12,14 +12,28 @@
 }
 
 # Oxidized and Smokeping have no login of their own: private (LAN) source addresses only.
+# For a login as well, set OXIDIZED_AUTH_USER and OXIDIZED_AUTH_HASH (SMOKEPING_AUTH_USER and SMOKEPING_AUTH_HASH)
+# in .env: HTTP Basic Auth is switched on for that name and stays off while the user is empty. The hash comes from
+# "docker run --rm caddy:2-alpine caddy hash-password" (README, Oxidized). Caddy reads the values when it starts.
+# The built-in hash is that of a random password nobody knows: a user without a hash cannot log in. It is never
+# checked while the user is empty, because the matcher is then false.
+
 {$CADDY_OXIDIZED_HOST:oxidized.localhost} {
 	@outside not remote_ip private_ranges 127.0.0.1/8 ::1
 	respond @outside 403
+	@auth_on expression `"{$OXIDIZED_AUTH_USER:}" != ""`
+	basic_auth @auth_on {
+		{$OXIDIZED_AUTH_USER:nobody} {$OXIDIZED_AUTH_HASH:$2a$14$4SHWJmtwHB3qHoNnVuIV6uTeN/PvWd/KwxjIrhxIuigZIi.jsWXVu}
+	}
 	reverse_proxy oxidized:8888
 }
 
 {$CADDY_SMOKEPING_HOST:smokeping.localhost} {
 	@outside not remote_ip private_ranges 127.0.0.1/8 ::1
 	respond @outside 403
+	@auth_on expression `"{$SMOKEPING_AUTH_USER:}" != ""`
+	basic_auth @auth_on {
+		{$SMOKEPING_AUTH_USER:nobody} {$SMOKEPING_AUTH_HASH:$2a$14$4SHWJmtwHB3qHoNnVuIV6uTeN/PvWd/KwxjIrhxIuigZIi.jsWXVu}
+	}
 	reverse_proxy smokeping:80
 }

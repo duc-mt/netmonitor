@@ -30,10 +30,52 @@ expect_call "compose restart librenms" restart librenms
 expect_call "compose logs -f --tail=100" logs
 expect_call "compose logs -f --tail=100 dispatcher" logs dispatcher
 expect_call "compose ps" status
-expect_call "compose exec -T --user librenms -w /opt/librenms librenms php validate.php" validate
-expect_call "compose exec -T --user librenms -w /opt/librenms librenms php addhost.php 192.168.1.1 -v 2c -c public" add-device 192.168.1.1 -v 2c -c public
-expect_call "compose exec -T --user librenms -w /opt/librenms librenms python3 snmp-scan.py 192.168.1.0/24" scan 192.168.1.0/24
+expect_call "compose exec -T librenms su -s /bin/sh librenms -c cd /opt/librenms && php validate.php \"\$@\" -- validate" validate
+expect_call "compose exec -T librenms su -s /bin/sh librenms -c cd /opt/librenms && php addhost.php \"\$@\" -- add-device 192.168.1.1 -v 2c -c public" add-device 192.168.1.1 -v 2c -c public
+expect_call "compose exec -T librenms su -s /bin/sh librenms -c cd /opt/librenms && python3 snmp-scan.py \"\$@\" -- scan 192.168.1.0/24" scan 192.168.1.0/24
 expect_call "compose exec -T librenms su -s /bin/sh librenms -c php /opt/librenms/lnms \"\$@\" -- lnms --version" lnms --version
+LNMS='compose exec -T librenms su -s /bin/sh librenms -c php /opt/librenms/lnms "$@" -- lnms'
+expect_call "$LNMS device:poll core-sw1 -vvv" poll-device core-sw1
+expect_call "$LNMS snmp:walk core-sw1 1.3.6.1.2.1.1" snmp-walk core-sw1 1.3.6.1.2.1.1
+expect_call "$LNMS device:ping core-sw1" ping-device core-sw1
+expect_call "$LNMS user:add bob -p s3cret -r global-read -e bob@example.com" user-add bob -p s3cret -r global-read -e bob@example.com
+
+echo "no container command uses --user librenms (it fails on Docker Desktop)"
+check "run.sh" test -z "$(grep -nE -e "exec .*--user|'--user'" scripts/run.sh || true)"
+check "run.ps1" test -z "$(grep -nE -e "exec .*--user|'--user'" scripts/run.ps1 || true)"
+
+echo "diagnostic verbs need an argument"
+for verb in poll-device snmp-walk ping-device user-add; do
+  run_code "$verb"
+  equals "$verb without an argument exits 1" 1 "$code"
+  equals "$verb without an argument calls nothing" "" "$(calls)"
+done
+
+echo "user-add"
+run_code user-add bob
+equals "exits 0" 0 "$code"
+pw=$(sed -n 's/^Generated secure password for bob: //p' out.txt)
+equals "generates a 24-character password" 24 "${#pw}"
+check "with upper case, lower case, a digit and a symbol" bash -c '[[ $1 == *[A-Z]* && $1 == *[a-z]* && $1 == *[0-9]* && $1 == *[\!\#%*+=]* ]]' _ "$pw"
+present "the generated password is the one passed to lnms" "user:add bob -p $pw -r admin"
+run_code user-add alice
+pw2=$(sed -n 's/^Generated secure password for alice: //p' out.txt)
+check "two generated passwords differ" test "$pw" != "$pw2"
+run_code user-add carol -p Given-Pass-1
+check "an explicit password is used" grep -q 'user:add carol -p Given-Pass-1 -r admin' "$FAKE_LOG"
+check "an explicit password is not printed back" test -z "$(grep -i 'generated' out.txt)"
+run_code user-add dave -r superuser
+equals "a bad role exits 1" 1 "$code"
+equals "a bad role calls nothing" "" "$(calls)"
+FAKE_USER_ADD_ERR='The username has already been taken.' run_code user-add bob
+equals "an existing user exits 1" 1 "$code"
+check "and says so" grep -q 'already exists' err.txt
+check "and prints no password" test -z "$(grep -i 'password' out.txt)"
+FAKE_USER_ADD_ERR='SQLSTATE[HY000] boom' run_code user-add bob
+equals "any other failure exits 1" 1 "$code"
+check "and shows the reason" grep -q 'boom' err.txt
+run_code user-add bob --nope
+equals "an unknown option exits 2" 2 "$code"
 
 echo "mistakes and missing prerequisites"
 run_code down -v
