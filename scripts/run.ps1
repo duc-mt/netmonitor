@@ -23,7 +23,7 @@
   .\scripts\run.ps1 ping-device <host>     # check a device with LibreNMS' own ping check
   .\scripts\run.ps1 sync-inventory         # write the LibreNMS devices as the netops inventory.csv (needs bash)
   .\scripts\run.ps1 update [-NoBackup]      # back up, pull newer images, restart, self-check
-  .\scripts\run.ps1 doctor [-Fix]           # check the setup (Docker, .env, profiles, memory); -Fix repairs permissions
+  .\scripts\run.ps1 doctor [-Fix] [-Notify|-NotifyAll|-NotifyTest]  # check the setup (Docker, .env, memory, disk, poller, SNMP, clock, ports); -Fix repairs permissions; -Notify sends problems to Telegram
 
 .NOTES
   If scripts are blocked:  powershell -ExecutionPolicy Bypass -File scripts\run.ps1 up
@@ -35,6 +35,12 @@ $Yes = $false
 $DryRun = $false
 $NoBackup = $false
 $Fix = $false
+$Notify = $false
+$NotifyAll = $false
+$NotifyTest = $false
+$Verify = $false
+$NoOffsite = $false
+$NoRollback = $false
 $ExtraArgs = @()
 
 $rawArgs = @($args)
@@ -43,7 +49,7 @@ if ($rawArgs.Count -gt 0 -and $rawArgs[0] -notmatch '^-') {
     $rawArgs = @($rawArgs | Select-Object -Skip 1)
     # These commands hand every argument on untouched and in order: switches like -y, -Fix or -DryRun are
     # meant for the tool behind them, not for this launcher.
-    if (@('lnms', 'user-add', 'oxidized-setup', 'poll-device', 'snmp-walk', 'ping-device', 'sync-inventory') -contains $Command) {
+    if (@('lnms', 'add-device', 'user-add', 'oxidized-setup', 'poll-device', 'snmp-walk', 'ping-device', 'sync-inventory', 'verify-backup') -contains $Command) {
         $ExtraArgs = @($rawArgs)
         $rawArgs = @()
     }
@@ -71,6 +77,12 @@ while ($i -lt $rawArgs.Count) {
         '^(-DryRun|--dry-run)$' { $DryRun = $true }
         '^(-NoBackup|--no-backup)$' { $NoBackup = $true }
         '^(-Fix|--fix)$' { $Fix = $true }
+        '^(-Notify|--notify)$' { $Notify = $true }
+        '^(-NotifyAll|--notify-all)$' { $NotifyAll = $true }
+        '^(-NotifyTest|--notify-test)$' { $NotifyTest = $true }
+        '^(-Verify|--verify)$' { $Verify = $true }
+        '^(-NoOffsite|--no-offsite)$' { $NoOffsite = $true }
+        '^(-NoRollback|--no-rollback)$' { $NoRollback = $true }
         default {
             if (-not $Name -and $Command -in @('restart', 'logs', 'restore', 'add-device', 'scan', 'lnms') -and $arg -notmatch '^-') {
                 $Name = $arg
@@ -107,7 +119,7 @@ function Show-Usage {
         '  .\scripts\run.ps1 add-device <host> [opts] add a device (e.g. .\scripts\run.ps1 add-device 192.168.1.1 -v 2c -c public)'
         '  .\scripts\run.ps1 scan <subnet> [options]  auto-discover subnet devices via SNMP (e.g. .\scripts\run.ps1 scan 192.168.1.0/24)'
         '  .\scripts\run.ps1 update [-NoBackup]      back up, pull newer images, restart, self-check'
-        '  .\scripts\run.ps1 doctor [-Fix]           check setup (Docker, .env, profiles, memory); -Fix repairs .env permissions'
+        '  .\scripts\run.ps1 doctor [-Fix] [-Notify]  check setup (Docker, .env, memory, disk, poller, SNMP, clock, ports); -Notify tells Telegram what changed (-NotifyAll: everything, -NotifyTest: a test message)'
         '  .\scripts\run.ps1 lnms [args...]          run LibreNMS CLI commands (e.g. .\scripts\run.ps1 lnms user:add <user> -r admin)'
         '  .\scripts\run.ps1 user-add <user> [-p <password>] [-r <role>] [-e <email>]  create a user (default role admin); without -p a password is generated'
         '  .\scripts\run.ps1 oxidized-setup [user] [--force]  pair Oxidized with LibreNMS: API token into .env, integration on'
@@ -120,13 +132,18 @@ function Show-Usage {
 
 # Run docker with a relaxed error preference (Windows PowerShell 5.1 treats stderr output as an error under 'Stop').
 # Returns the exit code; with -Capture also returns stdout lines (-Merge: stdout and stderr).
-function Invoke-Docker([string[]]$DockerArgs, [switch]$Capture, [switch]$Merge) {
+function Invoke-Docker([string[]]$DockerArgs, [switch]$Capture, [switch]$Merge, [string]$StdIn) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
         if ($Merge) {
             # stdout and stderr together, as text: for commands whose error message the caller wants to show
-            $lines = @(& docker @DockerArgs 2>&1 | ForEach-Object { "$_" })
+            if ($PSBoundParameters.ContainsKey('StdIn')) {
+                $lines = @($StdIn | & docker @DockerArgs 2>&1 | ForEach-Object { "$_" })
+            }
+            else {
+                $lines = @(& docker @DockerArgs 2>&1 | ForEach-Object { "$_" })
+            }
             return [pscustomobject]@{ Code = $LASTEXITCODE; Output = $lines }
         }
         if ($Capture) {
@@ -186,6 +203,13 @@ function Invoke-LibrenmsExec([string]$Tag, [string]$Cmd, [string[]]$ExecArgs = @
     return Invoke-Docker $dockerArgs
 }
 
+# lnms user:add with the password handed over on stdin: the container reads it itself, so it never shows up in the
+# command line of a process on the host.
+function Invoke-LnmsUserAdd([string]$Password, [string[]]$UserArgs) {
+    $dockerArgs = @('compose', 'exec', '-T', 'librenms', 'su', '-s', '/bin/sh', 'librenms', '-c', 'IFS= read -r pw; exec php /opt/librenms/lnms user:add "$@" -p "$pw"', '--', 'lnms') + $UserArgs
+    return Invoke-Docker $dockerArgs -Merge -StdIn $Password
+}
+
 function Get-FirstLine([object[]]$Lines) {
     return (@($Lines | Where-Object { "$_".Trim() } | Select-Object -First 1) -join '')
 }
@@ -227,8 +251,69 @@ function Set-EnvValue([string]$Key, [string]$Value) {
     [System.IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# add-device. addhost.php was deprecated and is gone from LibreNMS 25.12 and later, so it is used only while the
+# image still has it; otherwise the same arguments go to "lnms device:add" ("-v 2c" becomes "--v2c").
+function Test-Addhost { return ((Invoke-Docker @('compose', 'exec', '-T', 'librenms', 'test', '-f', '/opt/librenms/addhost.php') -Capture).Code -eq 0) }
+
+function Add-OneDevice([bool]$Legacy, [string]$HostName, [string]$Ver, [string]$Comm) {
+    if ($Legacy) { return (Invoke-LibrenmsExec 'add-device' 'php addhost.php' @($HostName, $Comm, "v$Ver")).Code }
+    return (Invoke-Lnms @('device:add', $HostName, "--v$Ver", '-c', $Comm)).Code
+}
+
+# add-device --csv <file>: one device per line, "hostname[,snmp version[,community]]". Version defaults to 2c, the
+# community to LIBRENMS_SNMP_COMMUNITY. Blank lines, lines starting with # and a "hostname" header are skipped.
+function Invoke-AddDevicesCsv([bool]$Legacy, [string]$File) {
+    if (-not $File) { Fail 'usage: .\scripts\run.ps1 add-device --csv <file>   (lines: hostname[,version[,community]])' }
+    if (-not (Test-Path -LiteralPath $File)) { Fail "file not found: $File" }
+    $added = 0; $failed = 0; $first = $true
+    foreach ($line in @(Get-Content -LiteralPath $File)) {
+        if (-not $line.Trim() -or $line.StartsWith('#')) { continue }
+        $cols = @($line -split ',')
+        $hostName = $cols[0].Trim()
+        $ver = ''; if ($cols.Count -ge 2) { $ver = $cols[1].Trim() }
+        $comm = ''; if ($cols.Count -ge 3) { $comm = $cols[2].Trim() }
+        if ($first) { $first = $false; if ($hostName -match '^(?i)host(name)?$') { continue } }
+        if (-not $hostName) { continue }
+        if ($ver.StartsWith('v')) { $ver = $ver.Substring(1) }
+        if (-not $ver) { $ver = '2c' }
+        if (-not $comm) { $comm = Get-Setting 'LIBRENMS_SNMP_COMMUNITY' }
+        if ($ver -eq '3') { Write-Warning "skipped ${hostName}: SNMPv3 needs credentials, add it with .\scripts\run.ps1 add-device $hostName --v3 -u <user> ..."; $failed++; continue }
+        if (@('1', '2c') -notcontains $ver) { Write-Warning "skipped ${hostName}: unknown SNMP version '$ver' (use 1 or 2c)"; $failed++; continue }
+        if (-not $comm) { Write-Warning "skipped ${hostName}: no community in the file and LIBRENMS_SNMP_COMMUNITY is empty"; $failed++; continue }
+        Write-Host "Adding $hostName (SNMP $ver)"
+        if ((Add-OneDevice $Legacy $hostName $ver $comm) -eq 0) { $added++ } else { Write-Warning "failed: $hostName"; $failed++ }
+    }
+    Write-Host "Done: $added added, $failed failed or skipped."
+    if ($failed -gt 0) { return 1 }
+    return 0
+}
+
+function Invoke-AddDevice([string[]]$DevArgs) {
+    $legacy = Test-Addhost
+    if ($DevArgs.Count -ge 1 -and $DevArgs[0] -eq '--csv') {
+        $csvFile = ''; if ($DevArgs.Count -ge 2) { $csvFile = $DevArgs[1] }
+        return (Invoke-AddDevicesCsv $legacy $csvFile)
+    }
+    if ($DevArgs.Count -lt 1) { Fail 'usage: .\scripts\run.ps1 add-device <hostname-or-ip> [options]   or   add-device --csv <file>' }
+    if ($legacy) { return (Invoke-LibrenmsExec 'add-device' 'php addhost.php' $DevArgs).Code }
+    $out = @()
+    $n = 0
+    while ($n -lt $DevArgs.Count) {
+        if ($DevArgs[$n] -eq '-v') {
+            if ($n + 1 -ge $DevArgs.Count) { Fail 'add-device: -v needs a version (1, 2c or 3)' }
+            $n++
+            $ver = $DevArgs[$n]
+            if ($ver.StartsWith('v')) { $ver = $ver.Substring(1) }
+            $out += "--v$ver"
+        }
+        else { $out += $DevArgs[$n] }
+        $n++
+    }
+    return (Invoke-Lnms (@('device:add') + $out)).Code
+}
+
 function Invoke-UserAdd([string[]]$UserArgs) {
-    $user = ''; $password = ''; $role = 'admin'; $email = ''
+    $user = ''; $password = ''; $role = 'admin'; $email = ''; $fromStdin = $false
     $n = 0
     while ($n -lt $UserArgs.Count) {
         $a = $UserArgs[$n]
@@ -239,6 +324,7 @@ function Invoke-UserAdd([string[]]$UserArgs) {
             elseif (@('-r', '--role') -contains $a) { $role = $UserArgs[$n] }
             else { $email = $UserArgs[$n] }
         }
+        elseif ($a -eq '--password-stdin') { $fromStdin = $true }
         elseif ($a -match '^-') { Write-Host "error: user-add: unknown option: $a" -ForegroundColor Red; exit 2 }
         elseif ($user) { Write-Host "error: user-add: only one username, got '$user' and '$a'" -ForegroundColor Red; exit 2 }
         else { $user = $a }
@@ -246,11 +332,16 @@ function Invoke-UserAdd([string[]]$UserArgs) {
     }
     if (-not $user) { Fail 'usage: .\scripts\run.ps1 user-add <username> [-p <password>] [-r admin|global-read|user] [-e <email>]' }
     if (@('admin', 'global-read', 'user') -cnotcontains $role) { Fail "user-add: the role must be admin, global-read or user, not '$role'" }
+    if ($fromStdin) {
+        if ($password) { Write-Host 'error: user-add: use either -p or --password-stdin' -ForegroundColor Red; exit 2 }
+        $password = [Console]::In.ReadLine()
+        if (-not $password) { Fail 'user-add: --password-stdin read an empty password' }
+    }
     $generated = $false
     if (-not $password) { $password = New-Password; $generated = $true }
-    $lnmsArgs = @('user:add', $user, '-p', $password, '-r', $role)
+    $lnmsArgs = @($user, '-r', $role)
     if ($email) { $lnmsArgs += @('-e', $email) }
-    $result = Invoke-Lnms $lnmsArgs -Capture -Merge
+    $result = Invoke-LnmsUserAdd $password $lnmsArgs
     if ($result.Code -ne 0) {
         if (Test-UserExistsMessage ($result.Output -join "`n")) { Fail "user '$user' already exists (or the name is taken)" }
         Fail "could not create user '$user': $(Get-FirstLine $result.Output)"
@@ -340,6 +431,14 @@ function Invoke-Configure {
     Write-Host "Data retention: syslog $syslogDays days, event log $eventlogDays days"
     Set-Lnms @('config:set', 'syslog_purge', $syslogDays)
     Set-Lnms @('config:set', 'eventlog_purge', $eventlogDays)
+    # Optional extras: nothing is changed in LibreNMS while the variable is empty.
+    foreach ($pair in @(@('AUTHLOG_PURGE_DAYS', 'authlog_purge'), @('ALERTLOG_PURGE_DAYS', 'alert_log_purge'), @('RRD_PURGE_DAYS', 'rrd_purge'))) {
+        $extraDays = Get-Setting $pair[0]
+        if (-not $extraDays) { continue }
+        if ($extraDays -notmatch '^\d+$') { Fail "$($pair[0]) must be a number of days, not '$extraDays'" }
+        Write-Host "  $($pair[1]): $extraDays days"
+        Set-Lnms @('config:set', $pair[1], $extraDays)
+    }
 
     $adminUser = Get-Setting 'LIBRENMS_ADMIN_USER'
     $adminPw = Get-Setting 'LIBRENMS_ADMIN_PASSWORD'
@@ -349,7 +448,7 @@ function Invoke-Configure {
             Write-Host "lnms user:add $adminUser -p ******** -r admin"
         }
         else {
-            $added = Invoke-Lnms @('user:add', $adminUser, '-p', $adminPw, '-r', 'admin') -Capture -Merge
+            $added = Invoke-LnmsUserAdd $adminPw @($adminUser, '-r', 'admin')
             if ($added.Code -eq 0 -or (Test-UserExistsMessage ($added.Output -join "`n"))) {
                 Write-Host "  Admin account '$adminUser' is ready."
             }
@@ -410,6 +509,25 @@ function Invoke-Configure {
     Write-Host 'Done. If the worker count changed, restart the dispatcher: .\run.ps1 restart dispatcher'
 }
 
+# verify-backup [latest|name]: restore a backup set into a throw-away database to prove that it works. Nothing
+# running is touched.
+function Invoke-VerifyBackup([string[]]$VbArgs) {
+    $target = 'latest'
+    if ($VbArgs.Count -ge 1) { $target = $VbArgs[0] }
+    $target = Split-Path -Leaf $target
+    $target = $target -replace '-db\.sql\.gz$', '' -replace '-data\.tgz$', ''
+    if ($target -eq 'latest') {
+        $newest = Get-ChildItem -LiteralPath (Join-Path $Root 'backups') -Filter 'librenms-*-db.sql.gz' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+        if (-not $newest) { Fail 'no backups found in .\backups' }
+        $target = $newest.Name -replace '-db\.sql\.gz$', ''
+    }
+    if (-not $target.StartsWith('librenms-')) { $target = "librenms-$target" }
+    foreach ($suffix in @('-db.sql.gz', '-data.tgz')) {
+        if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $Root 'backups') "$target$suffix"))) { Fail "backups\$target-db.sql.gz and backups\$target-data.tgz must both exist" }
+    }
+    return (Invoke-Docker @('compose', 'run', '--rm', '--no-deps', '-e', "BACKUP_NAME=$target", 'tools', '/scripts/verify.sh')).Code
+}
+
 function Invoke-Update {
     $backups = Join-Path $Root 'backups'
     if (-not (Test-Path $backups)) { New-Item -ItemType Directory -Path $backups | Out-Null }
@@ -418,6 +536,14 @@ function Invoke-Update {
     $images = Invoke-Docker @('compose', 'images') -Capture
     $images.Output | Set-Content -LiteralPath $note -Encoding ASCII
     $images.Output | ForEach-Object { Write-Host $_ }
+    # repository, tag and image id of every container, for going back: "latest" is overwritten by the pull, but the
+    # old image is still on this computer under its id until it is pruned.
+    $snapshot = @()
+    foreach ($row in @($images.Output | Select-Object -Skip 1)) {
+        $f = @("$row".Trim() -split '\s+')
+        if ($f.Count -ge 4 -and $f[1] -ne '<none>' -and $f[2] -ne '<none>') { $snapshot += "$($f[1]) $($f[2]) $($f[3])" }
+    }
+    $snapshot = @($snapshot | Sort-Object -Unique)
 
     if ($NoBackup) {
         Write-Host '==> Skipping the backup (-NoBackup)'
@@ -434,8 +560,25 @@ function Invoke-Update {
     Write-Host '==> Restarting with the new images'
     if ((Invoke-Docker @('compose', 'up', '-d', '--wait')).Code -ne 0) {
         Write-Host 'error: the stack did not become healthy. See: .\run.ps1 logs' -ForegroundColor Red
-        Write-Host "To go back: put the previous tags from $note into .env and run .\run.ps1 up;"
-        Write-Host 'if the database was upgraded, also restore the backup: .\run.ps1 restore latest'
+        if (-not $NoRollback -and $snapshot.Count -gt 0) {
+            Write-Host '==> Going back to the previous images'
+            foreach ($entry in $snapshot) {
+                $e = $entry -split ' '
+                if ((Invoke-Docker @('tag', $e[2], "$($e[0]):$($e[1])") -Capture).Code -ne 0) { Write-Warning "could not restore $($e[0]):$($e[1]) (image $($e[2]) is gone)" }
+            }
+            if ((Invoke-Docker @('compose', 'up', '-d', '--wait')).Code -eq 0) {
+                Write-Host 'The previous version is running again; the update did not take effect. Try again later with .\run.ps1 update,'
+                Write-Host 'or pin LIBRENMS_VERSION in .env to a version that works.'
+            }
+            else {
+                Write-Host 'The previous images did not start either (the database may have been upgraded).'
+                Write-Host "Restore the backup: .\run.ps1 restore latest. The old image list is in $note"
+            }
+        }
+        else {
+            Write-Host "To go back: put the previous tags from $note into .env and run .\run.ps1 up;"
+            Write-Host 'if the database was upgraded, also restore the backup: .\run.ps1 restore latest'
+        }
         exit 1
     }
     Write-Host '==> LibreNMS self-check'
@@ -450,14 +593,99 @@ function Write-Check([string]$Level, [string]$Message) {
     switch ($Level) {
         'ok'   { Write-Host "  ok    $Message" }
         'info' { Write-Host "  info  $Message" }
-        'warn' { Write-Host "  WARN  $Message" -ForegroundColor Yellow; $script:DoctorWarnings++ }
-        'err'  { Write-Host "  ERROR $Message" -ForegroundColor Red; $script:DoctorErrors++ }
+        'warn' { Write-Host "  WARN  $Message" -ForegroundColor Yellow; $script:DoctorWarnings++; $script:DoctorReport += "- WARN $Message`n" }
+        'err'  { Write-Host "  ERROR $Message" -ForegroundColor Red; $script:DoctorErrors++; $script:DoctorReport += "- ERROR $Message`n" }
     }
+}
+
+function Get-HostLabel { if ($env:COMPUTERNAME) { return $env:COMPUTERNAME } return [System.Net.Dns]::GetHostName() }
+
+# The address people open LibreNMS at, for links in messages: NOTIFY_BASE_URL, else the proxy name, else this host
+# and LIBRENMS_PORT.
+function Get-BaseUrlLine {
+    $url = Get-Setting 'NOTIFY_BASE_URL'
+    if (-not $url -and (Test-Profile 'proxy')) {
+        $proxyHost = Get-Setting 'CADDY_LIBRENMS_HOST'
+        if ($proxyHost -and $proxyHost -notmatch '^http://' -and $proxyHost -notmatch '\.localhost$') { $url = "https://$proxyHost" }
+    }
+    if (-not $url) { $url = "http://$(Get-HostLabel):$(Get-Setting 'LIBRENMS_PORT' '8000')" }
+    return "LibreNMS: $($url.TrimEnd('/'))"
+}
+
+# Send a text with the Telegram bot of .env (the token is in the URL of an in-process request, on no command line).
+# Returns $true when it was sent.
+function Send-Telegram([string]$Text) {
+    $token = Get-Setting 'TELEGRAM_BOT_TOKEN'
+    $chat = Get-Setting 'TELEGRAM_CHAT_ID'
+    if (-not $token -or -not $chat) { Write-Warning '-Notify needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env'; return $false }
+    if ($Text.Length -gt 3800) { $Text = $Text.Substring(0, 3800) }   # Telegram refuses messages over 4096 characters
+    foreach ($attempt in 1..3) {
+        try {
+            [void](Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/sendMessage" -Body @{ chat_id = $chat; text = $Text } -TimeoutSec 20)
+            Write-Host 'Telegram: the report was sent.'
+            return $true
+        }
+        catch { if ($attempt -lt 3) { Start-Sleep -Seconds 2 } }
+    }
+    Write-Warning 'the Telegram message could not be sent'
+    return $false
+}
+
+# Tell Telegram what CHANGED since the last report: new problems, problems that are gone, and how many are still open.
+# The last report is kept in backups\.doctor-notify-state (one line per problem: the text without digits, a tab, the
+# text), so a number that moves (91 % full, then 92 %) is not a new problem. The state is updated only after a
+# successful send (or when nothing needed sending), so a failed send is retried. -All sends everything.
+function Send-DoctorChanges([string[]]$Lines, [int]$Errors, [int]$Warnings, [bool]$All) {
+    $red = [char]::ConvertFromUtf32(0x1F534); $yellow = [char]::ConvertFromUtf32(0x1F7E1); $green = [char]::ConvertFromUtf32(0x2705)
+    $backups = Join-Path $Root 'backups'
+    if (-not (Test-Path $backups)) { New-Item -ItemType Directory -Path $backups | Out-Null }
+    $state = Join-Path $backups '.doctor-notify-state'
+    $prev = @()
+    if (Test-Path -LiteralPath $state) { $prev = @(Get-Content -LiteralPath $state) }
+    $prevKeys = @($prev | ForEach-Object { ($_ -split "`t", 2)[0] })
+    $curKeys = @(); $new = ''; $resolved = ''; $still = 0
+    foreach ($line in $Lines) {
+        if (-not $line) { continue }
+        $key = $line -replace '\d', ''
+        $curKeys += $key
+        if (-not $All -and $prevKeys -contains $key) { $still++; continue }
+        if ($line.StartsWith('- ERROR ')) { $new += "$red $($line.Substring(8))`n" } else { $new += "$yellow $($line -replace '^- WARN ', '')`n" }
+    }
+    if (-not $All) {
+        foreach ($entry in $prev) {
+            $parts = $entry -split "`t", 2
+            if ($parts.Count -lt 2 -or $curKeys -contains $parts[0]) { continue }
+            $resolved += "$green $($parts[1] -replace '^- (ERROR|WARN) ', '')`n"
+        }
+    }
+    if ($new -or $resolved) {
+        if ($Errors -gt 0) { $icon = $red } elseif ($Warnings -gt 0) { $icon = $yellow } else { $icon = $green }
+        $text = "$icon netmonitor on $(Get-HostLabel): $(Get-Date -Format 'yyyy-MM-dd HH:mm')`n$Errors error(s), $Warnings warning(s) now`n"
+        if ($new) { $text += "`nNEW`n$new" }
+        if ($resolved) { $text += "`nRESOLVED`n$resolved" }
+        if ($still -gt 0) { $text += "`nSTILL OPEN: $still (reported before, unchanged)`n" }
+        $text += "`n$(Get-BaseUrlLine)"
+        if (-not (Send-Telegram $text)) { return }
+    }
+    $stateLines = @($Lines | Where-Object { $_ } | ForEach-Object { "$($_ -replace '\d', '')`t$_" })
+    [System.IO.File]::WriteAllText($state, ((($stateLines) -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Is something listening on this TCP port of the host?
+function Test-PortInUse([int]$Port) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        return ($iar.AsyncWaitHandle.WaitOne(500) -and $client.Connected)
+    }
+    catch { return $false }
+    finally { $client.Close() }
 }
 
 # Look for the mistakes that otherwise show up later as a container that never starts or a port that is
 # never published. Prints ok / info / WARN / ERROR lines; exits 1 if there is any ERROR.
 function Invoke-Doctor {
+    $script:DoctorReport = ''
     $script:DoctorErrors = 0
     $script:DoctorWarnings = 0
     $haveDocker = $false
@@ -606,6 +834,12 @@ function Invoke-Doctor {
     if ((Test-Profile 'syslog') -or (Test-Profile 'traps') -or (Test-Profile 'netflow')) {
         Write-Check 'info' 'syslog, trap and flow ports are open to every sender: restrict them (see README, Firewall)'
     }
+    if ((Test-Profile 'oxidized') -and (Get-Setting 'OXIDIZED_NOTIFY_TELEGRAM' 'false') -eq 'true') {
+        if (-not (Get-Setting 'TELEGRAM_BOT_TOKEN') -or -not (Get-Setting 'TELEGRAM_CHAT_ID')) {
+            Write-Check 'warn' 'OXIDIZED_NOTIFY_TELEGRAM is true but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty: no config-change messages will be sent'
+        }
+        else { Write-Check 'ok' 'oxidized: config changes are sent to Telegram' }
+    }
     if (Test-Profile 'proxy') {
         foreach ($who in @('OXIDIZED', 'SMOKEPING')) {
             $authUser = Get-Setting "${who}_AUTH_USER"
@@ -725,13 +959,68 @@ function Invoke-Doctor {
         }
     }
 
+    Write-Host 'SNMP'
+    $community = Get-Setting 'LIBRENMS_SNMP_COMMUNITY'
+    if (@('public', 'private') -contains $community) {
+        Write-Check 'warn' "LIBRENMS_SNMP_COMMUNITY is '$community', the best-known SNMP community: use a secret one, or SNMPv3"
+    }
+    if ($running -contains 'db') {
+        $snmpSql = "SELECT COALESCE(SUM(snmpver IN ('v1','v2c') AND community IN ('public','private')), 0), COALESCE(SUM(snmpver IN ('v1','v2c')), 0) FROM devices WHERE disabled = 0 AND snmp_disable = 0"
+        $snmpCmd = 'IFS=; set -f; mariadb -N -B -u$MARIADB_USER -p$MARIADB_PASSWORD $MARIADB_DATABASE -e $1'
+        $snmpRows = "$((Invoke-Docker @('compose', 'exec', '-T', 'db', 'sh', '-c', $snmpCmd, 'sh', $snmpSql) -Capture).Output | Select-Object -First 1)".Trim()
+        $sp = @($snmpRows -split '\s+')
+        if ($sp.Count -lt 2 -or $sp[0] -notmatch '^\d+$' -or $sp[1] -notmatch '^\d+$') {
+            Write-Check 'info' 'SNMP: could not read the device SNMP versions from the database'
+        }
+        else {
+            if ([int]$sp[0] -gt 0) { Write-Check 'warn' "SNMP: $($sp[0]) device(s) use the community 'public' or 'private': change it on the device and in LibreNMS, or move to SNMPv3" }
+            if ([int]$sp[1] -gt 0) { Write-Check 'info' "SNMP: $($sp[1]) device(s) use SNMP v1/v2c, whose community strings are not encrypted; SNMPv3 authPriv is safer" }
+            else { Write-Check 'ok' 'SNMP: no device uses SNMP v1 or v2c' }
+        }
+    }
+
+    Write-Host 'Clock'
+    if ($running -contains 'librenms') {
+        $containerTime = "$((Invoke-Docker @('compose', 'exec', '-T', 'librenms', 'date', '+%s') -Capture).Output | Select-Object -First 1)".Trim()
+        if ($containerTime -notmatch '^\d+$') { Write-Check 'info' 'clock: could not read the time in the LibreNMS container' }
+        else {
+            $skew = [math]::Abs([long]$containerTime - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+            if ($skew -gt 60) { Write-Check 'warn' "clock: the LibreNMS container is $skew s away from this host: graphs, alerts and SNMP timestamps drift (restart Docker Desktop)" }
+            else { Write-Check 'ok' 'clock: the container and this host agree (within 60 s)' }
+        }
+    }
+
+    Write-Host 'Host ports'
+    $portsTaken = $false
+    foreach ($row in @(
+            @('librenms', '', 'LIBRENMS_PORT', '8000'), @('grafana', 'grafana', 'GRAFANA_PORT', '3001'),
+            @('oxidized', 'oxidized', 'OXIDIZED_PORT', '8888'), @('smokeping', 'smokeping', 'SMOKEPING_PORT', '8085'),
+            @('nfsen', 'netflow', 'NFSEN_WEB_PORT', '8080'), @('caddy', 'proxy', 'CADDY_HTTP_PORT', '80'),
+            @('caddy', 'proxy', 'CADDY_HTTPS_PORT', '443'))) {
+        if ($row[1] -and -not (Test-Profile $row[1])) { continue }
+        if ($running -contains $row[0]) { continue }
+        $portNumber = Get-Setting $row[2] $row[3]
+        if ($portNumber -match '^\d+$' -and (Test-PortInUse ([int]$portNumber))) {
+            Write-Check 'warn' "port $portNumber ($($row[2])) is already used by something else on this host, and $($row[0]) is not running: change $($row[2]) in .env"
+            $portsTaken = $true
+        }
+    }
+    if (-not $portsTaken) { Write-Check 'ok' 'no port of a stopped service is taken by another program' }
+
     Write-Host ''
     Write-Host "$($script:DoctorErrors) error(s), $($script:DoctorWarnings) warning(s)"
+    if ($Notify -or $NotifyAll) {
+        $reportLines = @($script:DoctorReport -split "`n" | Where-Object { $_ })
+        if ($NotifyAll) {
+            if (($script:DoctorErrors + $script:DoctorWarnings) -gt 0) { Send-DoctorChanges $reportLines $script:DoctorErrors $script:DoctorWarnings $true }
+        }
+        else { Send-DoctorChanges $reportLines $script:DoctorErrors $script:DoctorWarnings $false }
+    }
     if ($script:DoctorErrors -gt 0) { exit 1 }
 }
 
 if (@('help', '--help', '-h', '/?') -contains $Command) { Show-Usage; exit 0 }
-if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan', 'lnms', 'user-add', 'oxidized-setup', 'poll-device', 'snmp-walk', 'ping-device', 'sync-inventory') -notcontains $Command) {
+if (@('up', 'down', 'restart', 'logs', 'status', 'backup', 'restore', 'validate', 'configure', 'update', 'doctor', 'add-device', 'scan', 'lnms', 'user-add', 'oxidized-setup', 'poll-device', 'snmp-walk', 'ping-device', 'sync-inventory', 'verify-backup') -notcontains $Command) {
     Write-Host "error: unknown command: $Command" -ForegroundColor Red
     Show-Usage
     exit 2
@@ -765,7 +1054,7 @@ try {
             $code = (Invoke-Docker $dockerArgs).Code
         }
         'backup' {
-            & (Join-Path (Join-Path $Root 'scripts') 'backup.ps1') -Keep $Keep
+            & (Join-Path (Join-Path $Root 'scripts') 'backup.ps1') -Keep $Keep -Verify:$Verify -NoOffsite:$NoOffsite
             $code = $LASTEXITCODE
         }
         'restore' {
@@ -775,16 +1064,17 @@ try {
         }
         'configure' { Invoke-Configure }
         'update'    { Invoke-Update }
-        'doctor'    { Invoke-Doctor }
+        'doctor'    {
+            if ($NotifyTest) {
+                $ok = Send-Telegram "$([char]::ConvertFromUtf32(0x2705)) netmonitor on $(Get-HostLabel): test message, $(Get-Date -Format 'yyyy-MM-dd HH:mm')`nTelegram notifications from doctor -Notify work.`n$(Get-BaseUrlLine)"
+                if (-not $ok) { exit 1 }
+            }
+            else { Invoke-Doctor }
+        }
         'validate' {
             $code = (Invoke-LibrenmsExec 'validate' 'php validate.php' $ExtraArgs).Code
         }
-        'add-device' {
-            if (-not $Name) { Fail 'usage: .\scripts\run.ps1 add-device <hostname-or-ip> [options]' }
-            $argsList = @($Name)
-            if ($ExtraArgs) { $argsList += $ExtraArgs }
-            $code = (Invoke-LibrenmsExec 'add-device' 'php addhost.php' $argsList).Code
-        }
+        'add-device' { $code = Invoke-AddDevice $ExtraArgs }
         'lnms' {
             $cmdArgs = @()
             if ($ExtraArgs) { $cmdArgs += $ExtraArgs }
@@ -798,6 +1088,7 @@ try {
             if ($ExtraArgs) { $argsList += $ExtraArgs }
             $code = (Invoke-LibrenmsExec 'scan' 'python3 snmp-scan.py' $argsList).Code
         }
+        'verify-backup'  { $code = Invoke-VerifyBackup $ExtraArgs }
         'user-add'       { Invoke-UserAdd $ExtraArgs }
         'oxidized-setup' { Invoke-OxidizedSetup $ExtraArgs }
         'poll-device' {

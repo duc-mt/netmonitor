@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake timedatectl: "show -p NTPSynchronized --value" prints $FAKE_NTP (default yes).
+echo "${FAKE_NTP:-yes}"

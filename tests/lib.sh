@@ -32,7 +32,10 @@ present() { if grep -qF -- "$2" "$FAKE_LOG"; then pass "$1"; else fail "$1"; fi;
 absent() { if grep -qF -- "$2" "$FAKE_LOG"; then fail "$1"; else pass "$1"; fi; }
 
 # The docker calls the script under test made, without the two start-up checks.
-calls() { grep -v -x -e 'compose version' -e 'info' "$FAKE_LOG" || true; }
+# (The probe for addhost.php is left out as well: it is a question, not an action.)
+calls() { grep -v -x -e 'compose version' -e 'info' -e 'compose exec -T librenms test -f /opt/librenms/addhost.php' "$FAKE_LOG" || true; }
+# What the fake docker read from stdin (the password that user:add is given).
+stdin_log() { cat "$FAKE_LOG.stdin" 2>/dev/null || true; }
 
 # Copy the project to a temp folder, create a minimal .env, put the fake docker first in PATH, go there.
 sandbox() {

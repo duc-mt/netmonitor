@@ -15,7 +15,9 @@ doctor_with() {
   ./run doctor >out.txt 2>err.txt || code=$?
 }
 said() { grep -Fq -- "$1" out.txt; }
-BASE=$'MYSQL_PASSWORD=secret\nLIBRENMS_SNMP_COMMUNITY=comm'
+# A port nothing listens on, so that the port check does not depend on what runs on the machine.
+FREE=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])' 2>/dev/null || echo 38999)
+BASE=$'MYSQL_PASSWORD=secret\nLIBRENMS_SNMP_COMMUNITY=comm\nLIBRENMS_PORT='$FREE
 
 echo "a healthy default setup"
 doctor_with "$BASE"
@@ -220,6 +222,185 @@ check "a hash that is not bcrypt is a warning" said "OXIDIZED_AUTH_HASH does not
 doctor_with "$BASE
 OXIDIZED_AUTH_USER=ops"
 if said "OXIDIZED_AUTH"; then fail "auth settings are ignored without the proxy profile"; else pass "auth settings are ignored without the proxy profile"; fi
+
+echo "SNMP posture"
+doctor_with "$BASE"
+check "no data from the database is only info" said "could not read the device SNMP versions"
+FAKE_SNMP_ROWS='0\t0\n' ./run doctor >out.txt 2>err.txt || true
+check "no v1/v2c device is ok" said "no device uses SNMP v1 or v2c"
+FAKE_SNMP_ROWS='2\t5\n' ./run doctor >out.txt 2>err.txt || true
+check "default communities on devices are a warning" said "2 device(s) use the community 'public' or 'private'"
+check "v1/v2c devices are reported" said "5 device(s) use SNMP v1/v2c"
+doctor_with "MYSQL_PASSWORD=secret
+LIBRENMS_SNMP_COMMUNITY=public
+LIBRENMS_PORT=$FREE"
+check "a 'public' community in .env is a warning" said "LIBRENMS_SNMP_COMMUNITY is 'public'"
+
+echo "clock"
+doctor_with "$BASE"
+check "matching clocks are ok" said "the container and this host agree"
+FAKE_CONTAINER_TIME=$(( $(date +%s) + 300 )) ./run doctor >out.txt 2>err.txt || true
+check "a skewed container clock is a warning" said "s away from this host"
+FAKE_NTP=no ./run doctor >out.txt 2>err.txt || true
+check "an unsynchronized host clock is a warning" said "not synchronized with a time server"
+FAKE_CONTAINER_TIME=x ./run doctor >out.txt 2>err.txt || true
+check "an unreadable container clock is only info" said "could not read the time in the LibreNMS container"
+
+echo "host ports"
+doctor_with "$BASE"
+check "a quiet host has no port conflict" said "no port of a stopped service is taken"
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c "import socket, time; s = socket.socket(); s.bind(('127.0.0.1', $FREE)); s.listen(1); time.sleep(20)" &
+  listener=$!
+  sleep 1
+  FAKE_RUNNING='' ./run doctor >out.txt 2>err.txt || true
+  check "a taken port of a stopped service is a warning" said "port $FREE (LIBRENMS_PORT) is already used"
+  ./run doctor >out.txt 2>err.txt || true
+  if said "is already used"; then fail "a running service's own port is fine"; else pass "a running service's own port is fine"; fi
+  kill "$listener" 2>/dev/null || true
+  wait "$listener" 2>/dev/null || true
+else
+  echo "  skip  python3 is not installed"
+fi
+
+echo "certificates"
+CERT="$BASE
+COMPOSE_PROFILES=proxy
+CADDY_LIBRENMS_HOST=nms.example.com"
+doctor_with "$CERT"
+FAKE_RUNNING='db redis librenms dispatcher caddy' ./run doctor >out.txt 2>err.txt || true
+check "a valid certificate is ok" said "certificate for nms.example.com is valid"
+FAKE_CERT_EXIT=1 FAKE_RUNNING='db redis librenms dispatcher caddy' ./run doctor >out.txt 2>err.txt || true
+check "an expiring or unreadable certificate is a warning" said "certificate for nms.example.com could not be read or expires within 14 days"
+doctor_with "$BASE
+COMPOSE_PROFILES=proxy"
+FAKE_RUNNING='db redis librenms dispatcher caddy' ./run doctor >out.txt 2>err.txt || true
+check ".localhost names need no check" said "only .localhost names"
+
+echo "doctor --notify"
+WEAK="MYSQL_PASSWORD=secret
+LIBRENMS_SNMP_COMMUNITY=public
+LIBRENMS_PORT=$FREE"
+TG="TELEGRAM_BOT_TOKEN=123:SECRETTOKEN
+TELEGRAM_CHAT_ID=-100555"
+notify() {  # notify <.env text> [VAR=value ...]: run doctor --notify, keep the docker/curl log fresh
+  printf '%s\n' "$1" > .env; chmod 600 .env
+  shift
+  : > "$FAKE_LOG"; code=0
+  env "$@" ./run doctor --notify >out.txt 2>err.txt || code=$?
+}
+sent() { grep -c '^curl ' "$FAKE_LOG" || true; }
+rm -f backups/.doctor-notify-state
+
+notify "$WEAK
+$TG" X=1
+equals "a warning does not change the exit code" 0 "$code"
+check "the first report is sent" test "$(sent)" -eq 1
+check "with the host and a time" grep -Eq 'text=.* netmonitor on .*: 20[0-9]{2}-[0-9]{2}-[0-9]{2} ' "$FAKE_LOG"
+check "with the counts" grep -q '0 error(s), 1 warning(s) now' "$FAKE_LOG"
+check "the problem is listed as NEW with a yellow mark" grep -q "NEW" "$FAKE_LOG"
+check "and names it" grep -q 'LIBRENMS_SNMP_COMMUNITY is' "$FAKE_LOG"
+check "with a link to LibreNMS" grep -q "LibreNMS: http://.*:$FREE" "$FAKE_LOG"
+check "to the configured chat" grep -q 'chat_id=-100555' "$FAKE_LOG"
+check "the bot token is only in the stdin config" grep -q 'bot123:SECRETTOKEN/sendMessage' "$FAKE_LOG.curl"
+absent "the bot token is on no command line" "SECRETTOKEN"
+check "it says so" said "Telegram: the report was sent"
+check "the state is kept" test -s backups/.doctor-notify-state
+
+notify "$WEAK
+$TG" X=1
+check "the same problem again sends nothing" test "$(sent)" -eq 0
+
+notify "$WEAK
+$TG
+NOTIFY_BASE_URL=https://nms.example.com/" X=1
+check "an unchanged problem still sends nothing (the link does not matter)" test "$(sent)" -eq 0
+
+notify "$WEAK
+$TG
+DOCTOR_VOLUME_WARN_GB=x" X=1
+check "a new problem is sent as NEW" grep -q 'DOCTOR_VOLUME_WARN_GB' "$FAKE_LOG"
+check "and the old one is counted as still open" grep -q 'STILL OPEN: 1' "$FAKE_LOG"
+check "with the configured link" test "$(sent)" -eq 1
+
+notify "MYSQL_PASSWORD=secret
+LIBRENMS_SNMP_COMMUNITY=comm
+LIBRENMS_PORT=$FREE
+NOTIFY_BASE_URL=https://nms.example.com/
+$TG" X=1
+check "solved problems are reported as RESOLVED" grep -q 'RESOLVED' "$FAKE_LOG"
+check "with their text" grep -q 'LIBRENMS_SNMP_COMMUNITY is' "$FAKE_LOG"
+check "and a green mark instead of a severity word" test -z "$(grep -E 'RESOLVED' -A3 "$FAKE_LOG" | grep -E ' (WARN|ERROR) ')"
+check "the link uses NOTIFY_BASE_URL without a double slash" grep -q 'LibreNMS: https://nms.example.com$' "$FAKE_LOG"
+check "no problems are left" grep -q '0 error(s), 0 warning(s) now' "$FAKE_LOG"
+notify "MYSQL_PASSWORD=secret
+LIBRENMS_SNMP_COMMUNITY=comm
+LIBRENMS_PORT=$FREE
+$TG" X=1
+check "a healthy setup that was healthy sends nothing" test "$(sent)" -eq 0
+
+echo "a moving number is not a new problem"
+rm -f backups/.doctor-notify-state
+printf '%s\n' "$BASE
+$TG" > .env; chmod 600 .env
+: > "$FAKE_LOG"
+FAKE_DF='overlay 100000000 91000000 9000000 91% /x\n1048576\n' ./run doctor --notify >out.txt 2>err.txt || true
+check "the first report is sent" test "$(sent)" -eq 1
+: > "$FAKE_LOG"
+FAKE_DF='overlay 100000000 93000000 7000000 93% /x\n1048576\n' ./run doctor --notify >out.txt 2>err.txt || true
+check "91% becoming 93% is not reported again" test "$(sent)" -eq 0
+
+echo "a failed send is retried"
+rm -f backups/.doctor-notify-state
+notify "$WEAK
+$TG" FAKE_CURL_EXIT=22
+check "a failed send is reported" grep -q 'could not be sent' err.txt
+check "and the exit code is not changed" test "$code" -eq 0
+notify "$WEAK
+$TG" X=1
+check "the next run sends the report again" test "$(sent)" -eq 1
+
+echo "doctor --notify-all"
+notify "$WEAK
+$TG" X=1
+check "an unchanged problem is not sent by --notify" test "$(sent)" -eq 0
+printf '%s\n' "$WEAK
+$TG" > .env; : > "$FAKE_LOG"
+./run doctor --notify-all >out.txt 2>err.txt || true
+check "--notify-all sends everything again" test "$(sent)" -eq 1
+
+echo "doctor --notify-test"
+printf '%s\n' "$WEAK
+$TG" > .env; : > "$FAKE_LOG"
+code=0; ./run doctor --notify-test >out.txt 2>err.txt || code=$?
+equals "exits 0" 0 "$code"
+check "sends a test message" grep -q 'test message' "$FAKE_LOG"
+check "without running the checks" test -z "$(grep 'compose ps' "$FAKE_LOG")"
+printf '%s\n' "$WEAK" > .env; : > "$FAKE_LOG"
+code=0; ./run doctor --notify-test >out.txt 2>err.txt || code=$?
+equals "without a bot it exits 1" 1 "$code"
+check "and says what is missing" grep -q 'needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID' err.txt
+printf '%s\n' "$WEAK
+$TG" > .env; : > "$FAKE_LOG"
+code=0; FAKE_CURL_EXIT=22 ./run doctor --notify-test >out.txt 2>err.txt || code=$?
+equals "a failed test message exits 1" 1 "$code"
+printf '%s\n' "$WEAK" > .env
+rm -f backups/.doctor-notify-state
+: > "$FAKE_LOG"
+./run doctor --notify >out.txt 2>err.txt || true
+check "no bot token: --notify says what is missing" grep -q 'needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID' err.txt
+
+echo "oxidized notifications"
+doctor_with "$BASE
+COMPOSE_PROFILES=oxidized
+OXIDIZED_NOTIFY_TELEGRAM=true"
+check "notifications without a bot are a warning" said "OXIDIZED_NOTIFY_TELEGRAM is true but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty"
+doctor_with "$BASE
+COMPOSE_PROFILES=oxidized
+OXIDIZED_NOTIFY_TELEGRAM=true
+TELEGRAM_BOT_TOKEN=1:a
+TELEGRAM_CHAT_ID=5"
+check "with a bot it is ok" said "config changes are sent to Telegram"
 
 echo "options and environment"
 ./run doctor --bogus >out.txt 2>err.txt || code=$?

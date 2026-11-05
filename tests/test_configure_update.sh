@@ -8,10 +8,12 @@ sandbox
 
 run_code() {
   : > "$FAKE_LOG"
+  : > "$FAKE_LOG.stdin"
   code=0
   ./run "$@" >out.txt 2>err.txt || code=$?
 }
 has_line() { grep -Fxq -- "$1" out.txt; }       # an exact line of the output
+present_line() { grep -qF -- "$1" "$FAKE_LOG"; }
 logged() { grep -Fxq -- "$1" "$FAKE_LOG"; }     # an exact docker call
 LNMS='compose exec -T librenms su -s /bin/sh librenms -c php /opt/librenms/lnms "$@" -- lnms'
 
@@ -99,6 +101,21 @@ run_code configure --dry-run
 equals "a non-numeric retention exits 1" 1 "$code"
 check "and names the setting" grep -q 'SYSLOG_PURGE_DAYS' err.txt
 
+echo "optional retention"
+printf 'MYSQL_PASSWORD=test\n' > .env
+run_code configure --dry-run
+absent_out() { if grep -q -- "$1" out.txt; then fail "$2"; else pass "$2"; fi; }
+absent_out 'authlog_purge' "empty extras change nothing in LibreNMS"
+printf 'MYSQL_PASSWORD=test\nAUTHLOG_PURGE_DAYS=14\nALERTLOG_PURGE_DAYS=180\nRRD_PURGE_DAYS=400\n' > .env
+run_code configure --dry-run
+check "login history retention" has_line 'lnms config:set authlog_purge 14'
+check "alert history retention" has_line 'lnms config:set alert_log_purge 180'
+check "RRD retention" has_line 'lnms config:set rrd_purge 400'
+printf 'MYSQL_PASSWORD=test\nRRD_PURGE_DAYS=x\n' > .env
+run_code configure --dry-run
+equals "a non-numeric extra exits 1" 1 "$code"
+check "and names it" grep -q 'RRD_PURGE_DAYS' err.txt
+
 echo "headless admin account"
 printf 'MYSQL_PASSWORD=test\n' > .env
 run_code configure --dry-run
@@ -109,7 +126,9 @@ check "dry run shows the user add" has_line 'lnms user:add root1 -p ******** -r 
 check "dry run does not print the password" test -z "$(grep 'S3cret' out.txt)"
 run_code configure
 equals "creates the admin account" 0 "$code"
-check "user:add gets the password from .env" logged "$LNMS user:add root1 -p S3cret!pass -r admin"
+check "user:add is called for the admin" present_line "-- lnms root1 -r admin"
+equals "the password from .env goes in on stdin" "S3cret!pass" "$(stdin_log)"
+absent "and is on no command line" "S3cret"
 check "says the account is ready" grep -q "Admin account 'root1' is ready" out.txt
 FAKE_USER_ADD_ERR='The username has already been taken.' run_code configure
 equals "an existing admin is not an error" 0 "$code"
@@ -179,8 +198,24 @@ present "--no-backup still pulls" 'compose pull --ignore-pull-failures'
 
 FAKE_UP_EXIT=1 run_code update --no-backup
 equals "an unhealthy restart exits 1" 1 "$code"
-check "and explains how to go back" grep -q 'To go back' err.txt
+check "and explains how to go back" grep -q 'Restore the backup: ./run restore latest' err.txt
 absent "and does not run the self-check" 'php validate.php'
+echo "update goes back to the old images when the new ones do not start"
+rm -f "$FAKE_LOG.upfailed"
+FAKE_UP_FAIL_ONCE=1 run_code update --no-backup
+equals "the update still fails (exit 1)" 1 "$code"
+check "the old image of librenms is tagged again" logged "tag abc123def456 librenms/librenms:latest"
+check "the old image of the database is tagged again" logged "tag fed654cba321 mariadb:10.11"
+check "the stack is started a second time" test "$(grep -c '^compose up -d --wait$' "$FAKE_LOG")" -eq 2
+check "it says the previous version runs again" grep -q 'previous version is running again' err.txt
+check "and does not run the self-check" test -z "$(grep 'php validate.php' "$FAKE_LOG")"
+FAKE_UP_EXIT=1 run_code update --no-backup
+equals "old images that do not start either: exit 1" 1 "$code"
+check "then the backup is suggested" grep -q 'Restore the backup: ./run restore latest' err.txt
+FAKE_UP_EXIT=1 run_code update --no-backup --no-rollback
+absent "--no-rollback does not tag anything" "compose tag"
+check "--no-rollback keeps the manual instructions" grep -q 'put the previous tags' err.txt
+
 run_code update --bogus
 equals "an unknown option exits 2" 2 "$code"
 

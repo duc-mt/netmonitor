@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fake curl: records the call in $FAKE_LOG and the config read from stdin (-K -) in $FAKE_LOG.curl; FAKE_CURL_EXIT fails it.
+echo "curl $*" >> "${FAKE_LOG:?FAKE_LOG must be set}"
+cat > "${FAKE_LOG}.curl"
+exit "${FAKE_CURL_EXIT:-0}"

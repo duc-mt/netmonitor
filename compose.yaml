@@ -410,10 +410,18 @@ services:
       OXIDIZED_LIBRENMS_TOKEN: "${OXIDIZED_LIBRENMS_TOKEN:-}"
       OXIDIZED_USERNAME: "${OXIDIZED_USERNAME:-}"
       OXIDIZED_PASSWORD: "${OXIDIZED_PASSWORD:-}"
+      # Optional hook (oxidized/notify.sh): Telegram message on a changed configuration, push of the repository
+      OXIDIZED_NOTIFY_TELEGRAM: "${OXIDIZED_NOTIFY_TELEGRAM:-false}"
+      OXIDIZED_NOTIFY_DIFF: "${OXIDIZED_NOTIFY_DIFF:-false}"
+      NOTIFY_BASE_URL: "${NOTIFY_BASE_URL:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+      OXIDIZED_GIT_REMOTE: "${OXIDIZED_GIT_REMOTE:-}"
     volumes:
       - oxidized:/data
       - ./oxidized/config.tmpl:/oxidized/config.tmpl:ro
       - ./oxidized/render-config.sh:/oxidized/render-config.sh:ro
+      - ./oxidized/notify.sh:/oxidized/notify.sh:ro
     depends_on:
       librenms:
         condition: service_healthy

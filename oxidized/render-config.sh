@@ -17,7 +17,20 @@ function rep(s, m, v,   i) {
   $0 = rep($0, "@OXIDIZED_USERNAME@", ENVIRON["OXIDIZED_USERNAME"])
   $0 = rep($0, "@OXIDIZED_PASSWORD@", ENVIRON["OXIDIZED_PASSWORD"])
   print
-}' /oxidized/config.tmpl > "$OXIDIZED_HOME/config"
+}' "${OXIDIZED_TEMPLATE:-/oxidized/config.tmpl}" > "$OXIDIZED_HOME/config"
+
+# Optional hook (notify.sh): a Telegram message when a configuration changed, and/or a push of the repository.
+if [ "${OXIDIZED_NOTIFY_TELEGRAM:-false}" = true ] || [ -n "${OXIDIZED_GIT_REMOTE:-}" ]; then
+  cat >> "$OXIDIZED_HOME/config" <<'HOOK'
+hooks:
+  notify:
+    type: exec
+    events: [post_store]
+    cmd: '/oxidized/notify.sh'
+    async: true
+    timeout: 60
+HOOK
+fi
 chmod 600 "$OXIDIZED_HOME/config"
 
 if [ -z "${OXIDIZED_LIBRENMS_TOKEN:-}" ]; then

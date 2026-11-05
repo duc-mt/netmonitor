@@ -4,7 +4,7 @@
   "tags": ["librenms", "netmonitor"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "1m",
   "time": { "from": "now-24h", "to": "now" },
   "panels": [
@@ -19,7 +19,7 @@
       "id": 2, "type": "stat", "title": "Devices down", "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
       "datasource": { "type": "mysql", "uid": "librenms-db" },
       "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
-        "rawSql": "SELECT COUNT(*) AS down FROM devices WHERE status = 0 AND disabled = 0 AND ignore = 0" } ],
+        "rawSql": "SELECT COUNT(*) AS down FROM devices WHERE status = 0 AND disabled = 0 AND `ignore` = 0" } ],
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] }
     },
@@ -43,7 +43,7 @@
       "id": 5, "type": "table", "title": "Devices currently down", "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
       "datasource": { "type": "mysql", "uid": "librenms-db" },
       "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
-        "rawSql": "SELECT hostname, sysName, os, status_reason AS reason, last_polled FROM devices WHERE status = 0 AND disabled = 0 AND ignore = 0 ORDER BY hostname" } ]
+        "rawSql": "SELECT hostname, sysName, os, status_reason AS reason, last_polled FROM devices WHERE status = 0 AND disabled = 0 AND `ignore` = 0 ORDER BY hostname" } ]
     },
     {
       "id": 6, "type": "table", "title": "Latest events", "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
@@ -63,6 +63,43 @@
       "datasource": { "type": "mysql", "uid": "librenms-db" },
       "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
         "rawSql": "SELECT hostname, sysName, uptime AS uptime_seconds, last_polled FROM devices WHERE uptime < 86400 AND uptime > 0 AND disabled = 0 ORDER BY uptime" } ]
+    },
+    {
+      "id": 9, "type": "stat", "title": "Poller backlog (not polled for 15 min)", "gridPos": { "h": 4, "w": 8, "x": 0, "y": 21 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "description": "The same query as ./run doctor: devices that are up and enabled but were not polled for 15 minutes.",
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COALESCE(SUM(last_polled IS NULL OR last_polled < NOW() - INTERVAL 15 MINUTE), 0) AS backlog FROM devices WHERE disabled = 0 AND status = 1" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 10, "type": "stat", "title": "Slow polls (over 300 s)", "gridPos": { "h": 4, "w": 8, "x": 8, "y": 21 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COALESCE(SUM(last_polled_timetaken > 300), 0) AS slow FROM devices WHERE disabled = 0 AND status = 1" } ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 11, "type": "stat", "title": "Longest poll", "gridPos": { "h": 4, "w": 8, "x": 16, "y": 21 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT COALESCE(MAX(last_polled_timetaken), 0) AS seconds FROM devices WHERE disabled = 0 AND status = 1" } ],
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 120 }, { "color": "red", "value": 300 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 12, "type": "table", "title": "Slowest devices to poll", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT hostname, os, last_polled_timetaken AS seconds, last_polled FROM devices WHERE disabled = 0 AND status = 1 ORDER BY last_polled_timetaken DESC LIMIT 10" } ]
+    },
+    {
+      "id": 13, "type": "table", "title": "Devices not polled for 15 minutes", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "datasource": { "type": "mysql", "uid": "librenms-db" },
+      "targets": [ { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+        "rawSql": "SELECT hostname, os, last_polled FROM devices WHERE disabled = 0 AND status = 1 AND (last_polled IS NULL OR last_polled < NOW() - INTERVAL 15 MINUTE) ORDER BY last_polled LIMIT 20" } ]
     }
   ]
 }

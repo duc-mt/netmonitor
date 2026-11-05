@@ -18,6 +18,7 @@ expect_call() {
 # run_code <run arguments...>: sets $code, keeps the output in out.txt and err.txt
 run_code() {
   : > "$FAKE_LOG"
+  : > "$FAKE_LOG.stdin"
   code=0
   ./run "$@" >out.txt 2>err.txt || code=$?
 }
@@ -38,7 +39,9 @@ LNMS='compose exec -T librenms su -s /bin/sh librenms -c php /opt/librenms/lnms 
 expect_call "$LNMS device:poll core-sw1 -vvv" poll-device core-sw1
 expect_call "$LNMS snmp:walk core-sw1 1.3.6.1.2.1.1" snmp-walk core-sw1 1.3.6.1.2.1.1
 expect_call "$LNMS device:ping core-sw1" ping-device core-sw1
-expect_call "$LNMS user:add bob -p s3cret -r global-read -e bob@example.com" user-add bob -p s3cret -r global-read -e bob@example.com
+UA='compose exec -T librenms su -s /bin/sh librenms -c IFS= read -r pw; exec php /opt/librenms/lnms user:add "$@" -p "$pw" -- lnms'
+expect_call "$UA bob -r global-read -e bob@example.com" user-add bob -p s3cret -r global-read -e bob@example.com
+equals "the password goes in on stdin" "s3cret" "$(stdin_log)"
 
 echo "no container command uses --user librenms (it fails on Docker Desktop)"
 check "run.sh" test -z "$(grep -nE -e "exec .*--user|'--user'" scripts/run.sh || true)"
@@ -57,12 +60,14 @@ equals "exits 0" 0 "$code"
 pw=$(sed -n 's/^Generated secure password for bob: //p' out.txt)
 equals "generates a 24-character password" 24 "${#pw}"
 check "with upper case, lower case, a digit and a symbol" bash -c '[[ $1 == *[A-Z]* && $1 == *[a-z]* && $1 == *[0-9]* && $1 == *[\!\#%*+=]* ]]' _ "$pw"
-present "the generated password is the one passed to lnms" "user:add bob -p $pw -r admin"
+equals "the generated password is the one given to lnms on stdin" "$pw" "$(stdin_log)"
+absent "the generated password is on no command line" "$pw"
 run_code user-add alice
 pw2=$(sed -n 's/^Generated secure password for alice: //p' out.txt)
 check "two generated passwords differ" test "$pw" != "$pw2"
 run_code user-add carol -p Given-Pass-1
-check "an explicit password is used" grep -q 'user:add carol -p Given-Pass-1 -r admin' "$FAKE_LOG"
+equals "an explicit password is used (on stdin)" "Given-Pass-1" "$(stdin_log)"
+present "and the user is passed as an argument" "lnms carol -r admin"
 check "an explicit password is not printed back" test -z "$(grep -i 'generated' out.txt)"
 run_code user-add dave -r superuser
 equals "a bad role exits 1" 1 "$code"
@@ -74,8 +79,56 @@ check "and prints no password" test -z "$(grep -i 'password' out.txt)"
 FAKE_USER_ADD_ERR='SQLSTATE[HY000] boom' run_code user-add bob
 equals "any other failure exits 1" 1 "$code"
 check "and shows the reason" grep -q 'boom' err.txt
+: > "$FAKE_LOG.stdin"; : > "$FAKE_LOG"
+code=0; printf 'piped-pass\n' | ./run user-add erin --password-stdin >out.txt 2>err.txt || code=$?
+equals "--password-stdin exits 0" 0 "$code"
+equals "--password-stdin passes the piped password on" "piped-pass" "$(stdin_log)"
+check "--password-stdin prints no password" test -z "$(grep -i 'generated' out.txt)"
+code=0; printf '' | ./run user-add erin --password-stdin >out.txt 2>err.txt || code=$?
+equals "--password-stdin with nothing piped exits 1" 1 "$code"
 run_code user-add bob --nope
 equals "an unknown option exits 2" 2 "$code"
+
+echo "add-device on images without addhost.php (LibreNMS 25.12 and later)"
+export FAKE_NO_ADDHOST=1
+DA='compose exec -T librenms su -s /bin/sh librenms -c php /opt/librenms/lnms "$@" -- lnms device:add'
+expect_call "$DA 192.168.1.1 --v2c -c public" add-device 192.168.1.1 -v 2c -c public
+expect_call "$DA 192.168.1.1 --v3 -u snmpuser" add-device 192.168.1.1 --v3 -u snmpuser
+expect_call "$DA 10.0.0.1 --v1 -c old" add-device 10.0.0.1 -v v1 -c old
+run_code add-device
+equals "add-device without a host exits 1" 1 "$code"
+run_code add-device 10.0.0.1 -v
+equals "-v without a version exits 1" 1 "$code"
+unset FAKE_NO_ADDHOST
+
+echo "add-device --csv"
+cat > devices.csv <<'CSV'
+# a comment
+hostname,version,community
+core-sw1,2c,secret1
+core-sw2
+ edge-1 , v1 , old-comm
+bad-v3,3,whatever
+bad-ver,9,x
+CSV
+printf 'LIBRENMS_SNMP_COMMUNITY=fallback\n' >> .env
+export FAKE_NO_ADDHOST=1
+run_code add-device --csv devices.csv
+equals "a skipped or failed row makes it exit 1" 1 "$code"
+present "row 1 is added" "device:add core-sw1 --v2c -c secret1"
+present "a missing version and community use the defaults" "device:add core-sw2 --v2c -c fallback"
+present "spaces and a leading v are tolerated" "device:add edge-1 --v1 -c old-comm"
+absent "SNMPv3 rows are not guessed" "bad-v3"
+absent "unknown versions are skipped" "bad-ver"
+check "the summary counts them" grep -q 'Done: 3 added, 2 failed or skipped' out.txt
+check "v3 rows say how to add them" grep -q 'SNMPv3 needs credentials' err.txt
+unset FAKE_NO_ADDHOST
+run_code add-device --csv devices.csv
+present "with addhost.php: host, community, version" "php addhost.php \"\$@\" -- add-device core-sw1 secret1 v2c"
+run_code add-device --csv missing.csv
+equals "a missing file exits 1" 1 "$code"
+run_code add-device --csv
+equals "no file exits 1" 1 "$code"
 
 echo "mistakes and missing prerequisites"
 run_code down -v

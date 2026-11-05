@@ -5,11 +5,15 @@
 #                     an empty value means nothing is running)
 #   FAKE_CONFIG_GET   what "lnms config:get ..." prints
 #   FAKE_UP_EXIT      exit code of "docker compose up -d --wait" (default 0)
+#   FAKE_UP_FAIL_ONCE set: the first "compose up -d --wait" fails, later ones use FAKE_UP_EXIT
 #   FAKE_FAIL_MATCH   any call containing this text fails with exit code 1
 #   FAKE_MEMTOTAL     what "docker info --format {{.MemTotal}}" prints, in bytes (default 8 GiB)
 #   FAKE_DB_ROWS      what a mariadb query through "compose exec -T db sh -c ..." prints (\n and \t are expanded)
 #   FAKE_DF           what the storage check of "doctor" reads: a df line, then the du size in KB (\n expanded)
 #   FAKE_API_TOKEN    the token "lnms api:token-create" prints (default: a Sanctum-style 7|... token)
+#   FAKE_SNMP_ROWS    what the SNMP-version query of "doctor" prints (weak and total counts, \t and \n expanded)
+#   FAKE_CONTAINER_TIME  what "date +%s" prints inside the container (default: the host's time)
+#   FAKE_NO_ADDHOST   1: the image has no addhost.php any more (LibreNMS 25.12 and later)
 #   FAKE_USER_ADD_ERR makes "lnms user:add" print this message on stderr and fail
 #   FAKE_SERVICES     what "docker compose config --services" lists (default: db redis librenms dispatcher)
 echo "$*" >> "${FAKE_LOG:?FAKE_LOG must be set}"
@@ -20,12 +24,18 @@ case "$*" in
   "compose version") echo "Docker Compose version v2.fake" ;;
   "compose config --services") echo "${FAKE_SERVICES:-db redis librenms dispatcher}" | tr ' ' '\n' ;;
   "compose ps --status running --services") echo "${FAKE_RUNNING-db redis librenms dispatcher}" | tr ' ' '\n' ;;
+  *"IFS= read -r pw"*) cat >> "${FAKE_LOG}.stdin"; if [ -n "${FAKE_USER_ADD_ERR:-}" ]; then echo "$FAKE_USER_ADD_ERR" >&2; exit 1; fi ;;
+  *"test -f /opt/librenms/addhost.php"*) exit "${FAKE_NO_ADDHOST:-0}" ;;
+  *snmpver*) printf '%b' "${FAKE_SNMP_ROWS:-}" ;;
+  *"date +%s"*) echo "${FAKE_CONTAINER_TIME:-$(date +%s)}" ;;
   *"df -Pk"*) printf '%b' "${FAKE_DF:-overlay 100000000 10000000 90000000 10% /data\\n1048576\\n}" ;;
   "compose exec -T db sh -c"*) printf '%b' "${FAKE_DB_ROWS:-}" ;;
-  "compose images") echo "CONTAINER REPOSITORY TAG" ;;
+  "compose images") printf 'CONTAINER REPOSITORY TAG IMAGE ID SIZE\nnm-librenms-1 librenms/librenms latest abc123def456 1.2GB\nnm-db-1 mariadb 10.11 fed654cba321 400MB\n' ;;
   *api:token-create*) printf 'API token created\n\n%s\n\nSave it now.\n' "${FAKE_API_TOKEN:-7|abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN}" ;;
   *user:add*) if [ -n "${FAKE_USER_ADD_ERR:-}" ]; then echo "$FAKE_USER_ADD_ERR" >&2; exit 1; fi ;;
   *config:get*) printf '%s\n' "${FAKE_CONFIG_GET:-}" ;;
-  "compose up -d --wait") exit "${FAKE_UP_EXIT:-0}" ;;
+  "compose up -d --wait")
+    if [ -n "${FAKE_UP_FAIL_ONCE:-}" ] && [ ! -f "$FAKE_LOG.upfailed" ]; then : > "$FAKE_LOG.upfailed"; exit 1; fi
+    exit "${FAKE_UP_EXIT:-0}" ;;
 esac
 exit 0

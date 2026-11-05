@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake openssl for the certificate check of "doctor": "s_client" prints nothing and "x509 -checkend" exits with
+# $FAKE_CERT_EXIT (default 0 = valid). Anything else goes to the real openssl, so setup.sh keeps working.
+case "$1" in
+  s_client) cat > /dev/null ;;
+  x509) cat > /dev/null; exit "${FAKE_CERT_EXIT:-0}" ;;
+  *) PATH=$(printf '%s' "$PATH" | sed 's|^[^:]*:||'); exec openssl "$@" ;;
+esac

@@ -67,11 +67,12 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run restart [service]     # restart everything, or one service
 ./run logs [service]        # follow the logs (Ctrl-C to stop)
 ./run status                # show the containers
-./run backup [--keep 7]     # Windows: .\scripts\run.ps1 backup -Keep 7
+./run backup [--keep 7]     # Windows: .\scripts\run.ps1 backup -Keep 7  (--verify: restore test, --no-offsite: skip the upload)
+./run verify-backup [name]  # restore a backup into a throw-away database to prove it works (default: the newest)
 ./run restore latest        # Windows: .\scripts\run.ps1 restore latest -Yes
 ./run validate              # LibreNMS' own self-check (validate.php)
 ./run configure             # apply the settings in .env to LibreNMS; safe to repeat (--dry-run: only show)
-./run add-device <host>     # add a device (e.g. ./run add-device 192.168.1.1 -v 2c -c public)
+./run add-device <host>     # add a device (e.g. ./run add-device 192.168.1.1 -v 2c -c public); --csv <file> adds many
 ./run scan <subnet>         # auto-discover subnet devices via SNMP (e.g. ./run scan 192.168.1.0/24)
 ./run lnms [command]        # run LibreNMS CLI commands (e.g. ./run lnms user:add <user> -r admin)
 ./run user-add <user>       # create a user (-r admin|global-read|user, -e <email>, -p <password>); without -p a 24-character password is generated and shown once
@@ -80,8 +81,8 @@ One launcher wraps the common tasks, with the same verbs on every platform:
 ./run snmp-walk <host> [oid]  # walk a device's SNMP tree from the LibreNMS container
 ./run ping-device <host>    # check a device with LibreNMS' own ping check
 ./run sync-inventory        # write the LibreNMS devices as the netops inventory.csv (see "netops inventory")
-./run update                # back up, pull newer images, restart, self-check (--no-backup skips the backup)
-./run doctor [--fix]        # check setup: Docker, .env, memory, disk, poller backlog (--fix repairs .env permissions)
+./run update                # back up, pull newer images, restart, self-check; goes back by itself if the new images fail (--no-backup, --no-rollback)
+./run doctor [--fix|--notify]  # check setup: Docker, .env, memory, disk, poller, SNMP, clock, ports (--notify: send problems to Telegram)
 ```
 
 It works from any directory (`./run up`). On Windows, use `scripts\run.bat up` (CMD) or `.\scripts\run.ps1 up` (PowerShell). If scripts are blocked, use
@@ -106,8 +107,26 @@ LibreNMS command line and self-check:
 ./run validate                                             # run self-check (validate.php)
 ```
 
-`user-add` prints a generated password once and stores it nowhere. The password is given to LibreNMS as a command-line
-argument, so other users of the same machine can see it while the command runs.
+`user-add` prints a generated password once and stores it nowhere. Passwords never appear on the command line of a
+process on the host: the launcher sends them to the container on stdin, where `lnms` reads them (a password given with
+`-p` is of course on your own command line and in your shell history; `--password-stdin` reads it from standard input
+instead, e.g. `read -rs pw; printf '%s\n' "$pw" | ./run user-add alice --password-stdin`).
+
+**Adding devices.** `./run add-device 192.168.1.1 -v 2c -c public` adds one. LibreNMS 25.12 removed the old `addhost.php`
+script; the launcher uses it only while the image still has it, and otherwise hands the same arguments to
+`lnms device:add` (`-v 2c` becomes `--v2c`; other options, such as `--v3 -u <user>`, go through unchanged: see
+`./run lnms device:add --help`). To add many devices, `./run add-device --csv devices.csv` with one device per line:
+
+```
+# hostname,version,community      (version defaults to 2c, the community to LIBRENMS_SNMP_COMMUNITY)
+core-sw1,2c,secret1
+core-sw2
+edge-1,1,old-community
+```
+
+Blank lines, lines starting with `#` and a `hostname` header line are skipped. SNMPv3 rows are refused (they need
+credentials; add those devices one by one). Every device is tried even if one fails; the exit code is 1 when any failed.
+`./run sync-inventory` is the reverse: it writes the devices of LibreNMS as the netops `inventory.csv`.
 
 Troubleshooting a device, all through the same container:
 
@@ -134,14 +153,55 @@ complete (the mail relay has an `SMTP_HOST`, the ntopng interface exists), that 
 the memory Docker has, which web UIs listen on every network, whether the services are running, and, when they are,
 how full the disk is under the `data`, `db` and (with NetFlow) `nfsen` volumes and whether the poller has a backlog
 (devices not polled for 15 minutes, or taking longer than the 5-minute cycle). It warns above 80 % disk use or 50 GB
-for one volume; `DOCTOR_DISK_WARN_PCT` and `DOCTOR_VOLUME_WARN_GB` change those limits. It does not check whether host
-ports are free.
+for one volume; `DOCTOR_DISK_WARN_PCT` and `DOCTOR_VOLUME_WARN_GB` change those limits.
+
+It also looks at the SNMP side (the community `public` or `private` in `.env` or on devices is a warning; the number of
+devices still on SNMP v1/v2c is shown, SNMPv3 authPriv is the safer choice), the clock (the LibreNMS container against this
+host, more than a minute apart is a warning; on Linux also whether the host clock is synchronized), the host ports of
+services that are not running (a port taken by another program is reported before `./run up` fails on it), and, with the
+proxy profile, whether a certificate for a public name expires within 14 days (needs `openssl`; Linux and macOS only).
+The Windows launcher does the same, except the certificate check and the synchronization of the host clock.
+
+**Hearing about problems.** `./run doctor --notify` (Windows: `doctor -Notify`) tells the Telegram chat of
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` what *changed* since the last run, so an hourly cron job does not repeat the same
+warning every hour:
+
+```
+🟡 netmonitor on nms01: 2026-11-05 10:30 UTC
+0 error(s), 2 warning(s) now
+
+NEW
+🔴 volume db: the disk holding it is 91% full (limit 80%) ...
+
+RESOLVED
+✅ poller: 3 device(s) not polled for over 15 minutes (backlog) ...
+
+STILL OPEN: 1 (reported before, unchanged)
+
+LibreNMS: https://nms.example.com
+```
+
+Nothing is sent when nothing changed (including "still healthy"). The last report is kept in `backups/.doctor-notify-state`;
+a number that only moves (91 % full, then 93 %) is not a new problem, and a failed send leaves the state alone so the next run
+tries again (curl also retries twice by itself). `--notify-all` sends the whole current list once, whatever was reported before.
+`./run doctor --notify-test` sends a test message and nothing else, so you can check the bot before you rely on it (exit code 1
+when it fails). The link is `NOTIFY_BASE_URL` from `.env`, else the public proxy name, else `http://<this host>:<LIBRENMS_PORT>`.
+The bot token is given to `curl` on stdin, not on its command line. With cron, once an hour:
+
+```
+5 * * * * cd /opt/librenms-docker && ./run doctor --notify >> backups/doctor.log 2>&1
+```
+
+On Windows use Task Scheduler with the action `powershell.exe -File C:\path\to\scripts\run.ps1 doctor -Notify`.
 
 **Updating.** `./run update` (Windows: `.\scripts\run.ps1 update`) lists the images in use and saves that list to
 `backups/update-<time>.txt`, backs up, pulls newer images (images you built yourself are skipped), restarts, and runs
-the self-check. If the stack does not become healthy it says so and stops; to go back, put the previous tags from the
-saved list into `.env`, run `./run up`, and, if the database was upgraded in between, restore the backup too
-(`./run restore latest`). A failing self-check is only reported, never rolled back. Read the LibreNMS release notes
+the self-check. If the stack does not become healthy it goes back by itself: the image ids of the old versions were
+noted before the pull (a tag such as `latest` is overwritten by the pull, the old image stays on the computer until it
+is pruned), so it tags them again and starts the stack once more. The update still counts as failed (exit 1). If the old
+images do not start either, the database was probably upgraded: restore the backup (`./run restore latest`).
+`--no-rollback` leaves the failed state as it is and prints the manual steps instead (put the previous tags from the
+saved list into `.env`, run `./run up`). A failing self-check is only reported, never rolled back. Read the LibreNMS release notes
 before upgrading across several versions.
 
 **Pinning versions.** `LIBRENMS_VERSION=latest` follows upstream. For reproducible deployments set a release tag in
@@ -177,15 +237,32 @@ A restore **replaces** the current database and data. Both archives are verified
 deleted, so a corrupt backup cannot destroy a working system. Backups contain device credentials:
 treat `./backups` as secret (it is git-ignored).
 
+### Proving a backup works
+
+A backup you have never restored is a hope, not a backup. `./run backup --verify` (Windows: `backup -Verify`) writes the
+new set, starts the dispatcher again, and then restores the set into a throw-away MariaDB server that lives only inside
+a temporary container folder: the dump must load without an error, the LibreNMS tables `devices`, `ports` and `users`
+must be there, and the data archive must be readable. The live database is never touched. Old sets are pruned
+(`--keep`) only after the new one passed, and a set that fails is reported and not uploaded. Check any set later with
+`./run verify-backup` (the newest) or `./run verify-backup librenms-20260101-120000`. Loading a big dump takes a few
+minutes and needs about 1 GB of free memory.
+
 ### Scheduled and off-site backups
 
 A backup is only useful if it runs by itself and does not live only on the machine it protects. The database dump holds
 the credentials LibreNMS stores for your devices, so treat the files in `./backups` as secrets.
 
+**Off-site copy.** Set `BACKUP_REMOTE` in `.env` to an [rclone](https://rclone.org) destination, for example
+`s3:my-bucket/netmonitor` or `sftp-nas:backups/netmonitor` (create the remote once with `rclone config`). Every
+`./run backup` then uploads the two files of the new set after they passed their checks; `--no-offsite` skips it once.
+A failed upload makes the command fail, and the local backup stays in `./backups`. Expiring old sets at the
+destination is up to you (a bucket lifecycle rule); `--keep` only prunes `./backups`. Keep the destination private:
+the dump holds the credentials LibreNMS stores for your devices.
+
 Linux, with cron (`crontab -e`; the project folder is the one you cloned into):
 
 ```
-30 2 * * * cd /opt/librenms-docker && ./run backup --keep 14 >> backups/cron.log 2>&1
+30 2 * * * cd /opt/librenms-docker && ./run backup --verify --keep 14 >> backups/cron.log 2>&1
 ```
 
 Linux, with a systemd timer (`systemctl enable --now librenms-backup.timer`):
@@ -627,7 +704,18 @@ Oxidized powers the native **Config** tab and visual diff viewer inside LibreNMS
    ./run lnms config:set oxidized.enabled true
    ./run lnms config:set oxidized.url http://oxidized:8888
    ```
-3. Restart Oxidized so that it reads the token: `./run restart oxidized`. Open <http://localhost:8888> for the raw node list; the
+3. Restart Oxidized so that it reads the token: `./run restart oxidized`.
+
+*Change notifications and a copy of the repository.* Set `OXIDIZED_NOTIFY_TELEGRAM=true` (with the Telegram bot of
+"Telegram alerts") and Oxidized sends a message whenever it stores a new configuration: `📝 Config changed: core-sw1
+(10.0.0.1, ios)`, the time and commit, the changed files, and a link to the device's *Config* tab (needs `NOTIFY_BASE_URL`).
+`OXIDIZED_NOTIFY_DIFF=true` adds up to 20 changed lines. A configuration holds secrets and Telegram is a third party, so this
+is off by default, and lines that look like they hold one (password, secret, community, key, token, hash, snmp-server, ...) are
+replaced by `<line hidden: may hold a secret>`; that is a filter, not a guarantee. `OXIDIZED_GIT_REMOTE=https://user:TOKEN@git.example.com/net/configs.git`
+pushes the configuration repository there after every change, as an off-site copy. Both are an `exec` hook
+(`oxidized/notify.sh`) that is only added to the Oxidized configuration while one of them is set; restart Oxidized after
+changing them. A failing message or push is written to `./run logs oxidized` and never stops Oxidized. The hook is
+tested here with stand-ins for Oxidized, Ruby and git, not against a real Oxidized. Open <http://localhost:8888> for the raw node list; the
    configurations are in the `oxidized` volume (`/data/configs.git` in the container).
 4. A device is backed up when its LibreNMS OS maps to an Oxidized model (LibreNMS has a mapping for the common ones; see
    its *Oxidized Integration* documentation to add or exclude devices and groups).
@@ -766,7 +854,11 @@ image. So `./run configure` also writes the number there; then run `./run restar
 docker compose restart dispatcher
 ```
 
-The two retention settings are written to LibreNMS' own `syslog_purge` and `eventlog_purge` by `./run configure`
+`AUTHLOG_PURGE_DAYS` (login history), `ALERTLOG_PURGE_DAYS` (alert history) and `RRD_PURGE_DAYS` can be set as well; they
+stay empty by default, which leaves LibreNMS' own defaults alone. Be careful with `RRD_PURGE_DAYS`: it **deletes** the graph
+files of devices that have not been updated for that many days.
+
+The retention settings are written to LibreNMS' own `syslog_purge` and `eventlog_purge` (and the optional ones) by `./run configure`
 (whole days; LibreNMS' daily cleanup does the deleting). They do not need a restart. Syslog and the event log are
 usually what makes the database grow fastest on a busy network, so lower them if `./run doctor` warns about disk use.
 
@@ -838,6 +930,10 @@ only as far as what is kept. Backups skip logs and cache, as described above.
   images' start-up, and could not be tried against a real Docker while this was written.
 - The mail relay is not published on the host. It does not ask LibreNMS to log in, so only attach containers to this
   Compose network that you trust.
+- The optional login for Oxidized and Smokeping (HTTPS section) has **no limit on wrong guesses**: stock Caddy has no rate
+  limiter, only a plugin build has. Use a long random password, keep the private-network rule, and do not publish
+  those names to the internet. `./run doctor` warns about default SNMP communities and shows how many devices still use
+  SNMP v1/v2c.
 - Use SNMPv3 authPriv for your devices where possible, restrict SNMP by source address on them, and use a strong admin
   password. Do not expose the web UI to the internet without TLS.
 
@@ -874,6 +970,9 @@ checked anywhere bash runs.
 | `tests/test_launcher.sh` | Each `run` verb issues the right command (always through `su -s /bin/sh librenms`), the diagnostic verbs and `user-add` (generated passwords included), mistakes are refused, `restore` accepts every way of naming a backup. |
 | `tests/test_configure_update.sh` | `configure` (settings from `.env`, retention, the headless admin account, whole-entry matching, safe to repeat), `oxidized-setup` and `update` (backup first, then pull and restart). |
 | `tests/test_doctor.sh` | `doctor` finds bad `NFSEN_SOURCES` entries, missing secrets, memory problems, exposed web UIs, full disks, big volumes, a poller backlog and bad proxy logins, and stays quiet on a healthy setup. |
+| `tests/test_backup.sh` | `backup --verify` (the dispatcher runs again before the restore test, old sets are pruned only after it passed), `--keep`, the rclone upload and `verify-backup`. |
+| `tests/test_container_scripts.sh` | `prune.sh`, and `verify.sh` against a real MariaDB (good set, not a LibreNMS dump, corrupt dump, SQL error, bad archive); skips itself without `mariadbd`. |
+| `tests/test_oxidized.sh` | The optional hook block that `render-config.sh` adds and what `notify.sh` does (Telegram text, push, failures), with stand-ins for Oxidized, Ruby and git. |
 | `tests/test_caddyfile.sh` | The optional Basic Auth in `caddy/Caddyfile` and its wiring; with a `caddy` binary in the PATH it also validates the file and tries the login for real. |
 | `tests/test_backup_tar.sh` | The backup archive leaves out logs and cache and keeps everything else (needs GNU tar). |
 | `tests/test_compose.py` | The real `docker compose config` of every profile, and the shell scripts embedded in `compose.yaml`. Skipped without Docker. |
@@ -888,19 +987,20 @@ until they have passed once, so remove that setting from `.github/workflows/ci.y
 compose.yaml                 the stack (web, dispatcher, db, redis, optional syslog/traps/ntopng/mail/netflow/grafana/oxidized/smokeping/proxy, tools helper)
 .env.example                 template; scripts/setup.* turn it into .env
 run                          universal cross-platform launcher (delegates to scripts/run.sh or scripts/run.bat)
-scripts/run.sh               Bash launcher: up, down, restart, logs, status, backup, restore, validate, configure, update, doctor, user-add, oxidized-setup, poll-device, snmp-walk, ping-device, sync-inventory
+scripts/run.sh               Bash launcher: up, down, restart, logs, status, backup, restore, verify-backup, validate, configure, update, doctor, add-device, scan, user-add, oxidized-setup, poll-device, snmp-walk, ping-device, sync-inventory
 scripts/run.bat              Windows CMD batch launcher (delegates to scripts/run.ps1)
 scripts/run.ps1              PowerShell launcher for Windows
 scripts/setup.sh|ps1         create .env with random secrets and start
 scripts/backup.sh|ps1        back up database and data
 scripts/restore.sh|ps1       restore from a backup
-scripts/container/*.sh       the logic that runs inside the helper container
+scripts/container/*.sh       the logic that runs inside the helper container (backup, prune, verify)
 scripts/netops-sync.sh       write the LibreNMS devices as a netops inventory.csv
 grafana/                     datasource and dashboard provisioning, dashboards (grafana profile)
-oxidized/                    config template and start script (oxidized profile)
+oxidized/                    config template, start script and change-notification hook (oxidized profile)
 caddy/Caddyfile              reverse proxy routes (proxy profile)
 tests/                       script tests with a fake docker, run by tests/all.sh and by CI
 .github/workflows/ci.yml     tests on Linux, macOS, Windows
+.github/workflows/lint.yml   shellcheck, PowerShell parse check, Caddyfile and dashboard validation, tests with MariaDB
 ```
 
 ## Credits and licence
